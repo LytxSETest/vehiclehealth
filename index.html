@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Vehicle Health</title>
+
+<!--
+  ============================================================================
+  VEHICLE HEALTH  -  Geotab custom-page Add-in (v3, two sections)
+  ============================================================================
+  SECTION 1  Breakdown Risk Score = 0.30 DTC + 0.20 T + 0.15 P + 0.15 U + 0.10 M + 0.10 B
+  SECTION 2  Emissions-system health (light-duty MIL/readiness + heavy-duty aftertreatment)
+
+  DESIGN PRINCIPLE: this is a framework you tune, not rework. Every signal,
+  threshold and weight lives in CONFIG. Every term/section detects what each
+  vehicle reports and scores only what is present, re-normalizing around what
+  is missing. Adding a signal = one CONFIG line. Re-calibrating = edit a number.
+
+  DATA SOURCES used:
+    FaultData      -> DTC term (native severity/riskOfBreakdown/lamp/state) + battery + device split
+    StatusData     -> coolant, voltages, fuel, MIL distance, codes-cleared, monitors,
+                      engine hours, oil life, and heavy-duty DPF/DEF/NOx/EGR (when present)
+    ExceptionEvent -> harsh-driving events (U term), matched to harsh rules by name
+    DVIRLog        -> open inspection defects (M term)
+
+  VALIDATED on the test fleet: DTC classification + scoring (battery->B, device
+  excluded, vehicle->DTC), bands. NOT yet validated (confirm by loading): harsh
+  events, DVIR defects, engine hours, oil life, and Section 2 signals - these are
+  wired with graceful fallback and contribute only where data exists.
+
+  NOT built (data this vehicle type cannot provide / certified elsewhere):
+    - catalyst O2-variance / converter-degradation model (no O2 voltages; curve
+      logging kills variance) -> replaced by MIL/readiness + aftertreatment health
+    - certified CO2/GHG accounting -> use Geotab Sustainability Center; the CO2 here
+      is a fuel-derived ESTIMATE for the operational view only
+  ============================================================================
+-->
+
+<style>
+  :root {
+    --vhs-fg:#1f2933; --vhs-muted:#6b7785; --vhs-line:#e3e8ee; --vhs-bg:#fff;
+    --vhs-b-normal:#2e7d32; --vhs-b-monitor:#9e9d24; --vhs-b-inspect:#ef6c00;
+    --vhs-b-priority:#d84315; --vhs-b-high:#b71c1c; --vhs-unknown:#90a4ae; --vhs-accent:#1565c0;
+  }
+  #vhs-root { font-family:system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--vhs-fg); font-size:13px; padding:16px 18px; }
+  #vhs-root h1 { font-size:16px; font-weight:600; margin:0 0 2px; }
+  .vhs-sub { color:var(--vhs-muted); margin:0 0 12px; }
+  .vhs-tabs { display:flex; gap:4px; margin-bottom:12px; border-bottom:1px solid var(--vhs-line); }
+  .vhs-tab { font:inherit; padding:7px 14px; border:none; background:none; color:var(--vhs-muted);
+             cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; }
+  .vhs-tab.vhs-on { color:var(--vhs-accent); border-bottom-color:var(--vhs-accent); font-weight:600; }
+  .vhs-controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  .vhs-controls label { color:var(--vhs-muted); }
+  .vhs-controls select,.vhs-controls button { font:inherit; padding:5px 10px; border:1px solid var(--vhs-line);
+      border-radius:6px; background:var(--vhs-bg); color:var(--vhs-fg); cursor:pointer; }
+  .vhs-controls button { background:var(--vhs-accent); color:#fff; border-color:var(--vhs-accent); }
+  .vhs-controls button:disabled { opacity:.55; cursor:default; }
+  .vhs-msg { color:var(--vhs-muted); margin:8px 0; }
+  table.vhs-table { border-collapse:collapse; width:100%; }
+  .vhs-table th,.vhs-table td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--vhs-line); white-space:nowrap; }
+  .vhs-table th { color:var(--vhs-muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
+  .vhs-num { font-variant-numeric:tabular-nums; }
+  .vhs-score { font-weight:700; font-size:15px; }
+  .vhs-band { display:inline-block; padding:2px 9px; border-radius:11px; color:#fff; font-size:11px; font-weight:600; }
+  .vhs-b-normal{background:var(--vhs-b-normal)} .vhs-b-monitor{background:var(--vhs-b-monitor)}
+  .vhs-b-inspect{background:var(--vhs-b-inspect)} .vhs-b-priority{background:var(--vhs-b-priority)}
+  .vhs-b-high{background:var(--vhs-b-high)} .vhs-b-unknown{background:var(--vhs-unknown)}
+  .vhs-disp { font-weight:600; }
+  .vhs-row { cursor:pointer; } .vhs-row:hover { background:#f7f9fb; }
+  .vhs-term { color:var(--vhs-muted); } .vhs-term.vhs-na { opacity:.4; }
+  .vhs-flag { display:inline-block; font-size:11px; padding:1px 6px; border-radius:4px; background:#eceff1; color:var(--vhs-muted); margin-left:6px; }
+  .vhs-detail td { background:#fafcfe; }
+  .vhs-detail table { width:100%; border-collapse:collapse; font-size:12px; }
+  .vhs-detail th,.vhs-detail td { padding:4px 8px; border-bottom:1px solid #eef2f6; white-space:normal; }
+  .vhs-caret { color:var(--vhs-muted); margin-right:6px; }
+  .vhs-note { font-size:11px; color:var(--vhs-muted); margin-top:10px; }
+</style>
+
+<script>
+geotab.addin.vehicleHealth = () => {
+
+  // ========================= CONFIG (tune here) =========================
+  const CONFIG = {
+    weights: { DTC:0.30, T:0.20, P:0.15, U:0.15, M:0.10, B:0.10 },
+    bands: [ [90,"High risk","vhs-b-high"], [75,"Priority maint.","vhs-b-priority"],
+             [60,"Schedule inspection","vhs-b-inspect"], [40,"Monitor","vhs-b-monitor"],
+             [0,"Normal","vhs-b-normal"] ],
+    maxDevices: 15, faultLookbackDays: 30, statusLookbackDays: 7,
+    faultLimit: 5000, exceptionLimit: 5000, dvirLimit: 1000, ruleLimit: 2000,
+
+    // ---- fault classification ----
+    batteryFaultKeywords: ["battery","low voltage"],
+    deviceFaultKeywords:  ["device","restarted","power was removed","gps","antenna","tamper","telematics"],
+    deviceControllerId:   "ControllerGoDeviceId",
+    stateMultiplier: { Active:1.0, Pending:0.6, Inactive:0.2 },
+    riskServiceNow: 40,
+    safetySystemKeywords: ["abs","brake","wheel speed","steering","stability"],  // elevate these
+
+    // ---- harsh-driving rules (U term), matched against Rule names ----
+    harshRuleKeywords: ["harsh","aggressive","acceleration","braking","cornering"],
+    harshRate: { normal:2, critical:30 },   // events over the window: <=2 ok, >=30 worst
+
+    // ---- thresholds (calibrate to your fleet / units) ----
+    idleRatio:    { normal:0.25, critical:0.60 },
+    fuel: { factorKgPerL: { gasoline:2.31, diesel:2.68 }, defaultType:"gasoline", idleWasteWarnL:50 },
+
+    // ---- SIGNALS. id used directly (robust); keyword is fallback. dir high|low.
+    //      Heavy-duty signals have no id here on purpose - resolved by keyword if
+    //      a vehicle reports them; absent on light-duty -> simply skipped. ----
+    signals: {
+      coolant:      { id:"DiagnosticEngineCoolantTemperatureId", keyword:"engine coolant temperature", dir:"high", normal:105, critical:120, term:"T" },
+      oilTemp:      { keyword:"engine oil temperature", dir:"high", normal:120, critical:140, term:"T" },
+      transTemp:    { keyword:"transmission", dir:"high", normal:110, critical:130, term:"T" },
+      oilPressure:  { keyword:"oil pressure", dir:"low",  normal:200, critical:80,  term:"P" },
+      fuelPressure: { keyword:"fuel rail pressure", dir:"low", normal:300, critical:150, term:"P" },
+      boost:        { keyword:"turbo boost", dir:"high", normal:200, critical:300, term:"P" },
+      deviceVoltage:{ id:"DiagnosticGoDeviceVoltageId", keyword:"telematics device voltage", dir:"low", normal:12.2, critical:11.4, term:"B" },
+      cranking:     { id:"DiagnosticCrankingVoltageId", keyword:"cranking voltage", dir:"low", normal:11.0, critical:9.0, term:"B" },
+      oilLife:      { keyword:"oil life", dir:"low", normal:30, critical:5, term:"M" }, // % remaining
+      fuelTotal:    { id:"DiagnosticDeviceTotalFuelId", keyword:"total fuel used (since" },
+      fuelIdle:     { id:"DiagnosticDeviceTotalIdleFuelId", keyword:"total fuel used while idling" },
+      engineHours:  { id:"DiagnosticEngineHoursId", keyword:"engine hours" },
+      engineHoursAdj:{ id:"DiagnosticEngineHoursAdjustmentId", keyword:"engine hours" },
+      // emissions
+      milDistance:  { id:"ak0pLOA92RkSyQDvovh8Afg", keyword:"malfunction indicator lamp (mil) on" }, // hashed ids here are THIS fleet's; re-discover per vehicle type
+      distSinceClear:{ id:"aKpyOK5cMZkmSE_isEqk8iA", keyword:"distance traveled since codes cleared" },
+      monCatalyst:  { id:"a-dPsmgsMg0OiBKjmQASXWQ", keyword:"catalyst monitor complete" },
+      monO2:        { id:"aQlf26vuLj06djxfNj-9rIQ", keyword:"oxygen sensor monitor complete" },
+      monEGR:       { id:"a2cJr2HdL9UiQeEcvYL_Wkw", keyword:"egr system monitor complete" },
+      monMisfire:   { id:"aDn7Ky78pnUmai2B3dmPmqQ", keyword:"misfire monitor complete" },
+      // heavy-duty (no id -> keyword resolve; skipped if absent)
+      dpfSoot:      { keyword:"particulate filter 1 soot", dir:"high", normal:60, critical:90 },
+      defLevel:     { keyword:"diesel exhaust fluid", dir:"low", normal:20, critical:5 },
+      noxIn:        { keyword:"nox", dir:"high" }, noxOut: { keyword:"outlet nox", dir:"high" },
+    },
+  };
+
+  // ========================= pure helpers =========================
+  const clamp=(n,lo,hi)=>Math.max(lo,Math.min(hi,n));
+  const lc=s=>(s||"").toLowerCase();
+  const maxOf=a=>a.length?Math.max.apply(null,a):null;
+  const num=v=>(typeof v==="number"&&!isNaN(v))?v:null;
+
+  function signalBadness(val,normal,critical,dir){
+    if(val==null||isNaN(val))return null;
+    if(dir==="high"){ if(val<=normal)return 0; if(val>=critical)return 100; return clamp((val-normal)/(critical-normal)*100,0,100); }
+    if(val>=normal)return 0; if(val<=critical)return 100; return clamp((normal-val)/(normal-critical)*100,0,100);
+  }
+  function severityToScore(sev){ const s=lc(sev); if(!s)return null;
+    if(s.indexOf("redstop")>-1||s.indexOf("severe")>-1||s.indexOf("critical")>-1)return 100;
+    if(s.indexOf("protect")>-1)return 70; if(s.indexOf("amber")>-1||s.indexOf("warning")>-1)return 60;
+    if(s.indexOf("maintenance")>-1||s.indexOf("none")>-1)return 25; return null; }
+  function lampToScore(f){ if(f.redStopLamp)return 100; if(f.protectWarningLamp)return 70;
+    if(f.amberWarningLamp||f.malfunctionLamp)return 60; return 0; }
+  function stateOf(f){ if(f.faultState)return f.faultState;
+    const e=f.faultStates&&f.faultStates.effectiveStatus;
+    if(e)return e.indexOf("Pending")>-1?"Pending":e.indexOf("Inactive")>-1?"Inactive":"Active"; return "Active"; }
+  function classify(f,name){
+    const hay=lc(((f.diagnostic&&f.diagnostic.id)||"")+" "+(name||"")); const hayNS=hay.replace(/\s+/g,"");
+    const hit=kws=>kws.some(k=>{k=lc(k); return hay.indexOf(k)>-1||hayNS.indexOf(k.replace(/\s+/g,""))>-1;});
+    if(hit(CONFIG.batteryFaultKeywords))return "battery";
+    if((f.controller&&f.controller.id===CONFIG.deviceControllerId)||hit(CONFIG.deviceFaultKeywords))return "device";
+    return "vehicle";
+  }
+  function isSafetyFault(name){ return CONFIG.safetySystemKeywords.some(k=>lc(name).indexOf(k)>-1); }
+
+  function groupByDiagnostic(records,nameById){
+    const by={};
+    records.forEach(f=>{ const id=f.diagnostic&&f.diagnostic.id; if(!id)return;
+      const g=by[id]||(by[id]={id,name:nameById[id]||id,occurrences:0,states:{},worstSeverity:null,worstLamp:0,maxRisk:null,safety:false,first:f.dateTime,last:f.dateTime});
+      g.occurrences++; const st=stateOf(f); g.states[st]=(g.states[st]||0)+1;
+      const sv=severityToScore(f.severity||f.diagnosticSeverity); if(sv!=null)g.worstSeverity=Math.max(g.worstSeverity||0,sv);
+      g.worstLamp=Math.max(g.worstLamp,lampToScore(f));
+      if(typeof f.riskOfBreakdown==="number")g.maxRisk=Math.max(g.maxRisk||0,f.riskOfBreakdown);
+      if(isSafetyFault(g.name))g.safety=true;
+      if(f.dateTime<g.first)g.first=f.dateTime; if(f.dateTime>g.last)g.last=f.dateTime; });
+    return Object.keys(by).map(k=>by[k]);
+  }
+  function scoreFaultGroup(g){
+    const parts=[]; if(g.worstSeverity!=null)parts.push(g.worstSeverity); if(g.worstLamp>0)parts.push(g.worstLamp); if(g.maxRisk!=null)parts.push(g.maxRisk);
+    let badness=parts.length?Math.max.apply(null,parts):15;
+    if(g.safety)badness=Math.max(badness,60);  // safety systems never trivial
+    const active=g.states.Active||0,pending=g.states.Pending||0,inactive=g.states.Inactive||0;
+    const dom=active?"Active":pending?"Pending":"Inactive";
+    const mult=CONFIG.stateMultiplier[dom]!=null?CONFIG.stateMultiplier[dom]:1.0;
+    const intermittent=(active>0&&inactive>0)||(g.occurrences>=5&&active>0);
+    return Object.assign(g,{badness,domState:dom,intermittent,contribution:clamp(badness*mult*(intermittent?1.1:1.0),0,100)});
+  }
+  function dtcTerm(groups){
+    if(!groups.length)return {score:0,items:[]};
+    const items=groups.map(scoreFaultGroup);
+    const worst=maxOf(items.map(i=>i.contribution))||0;
+    const moderate=items.filter(i=>i.contribution>=40).length;
+    return {score:clamp(worst+Math.min(20,Math.max(0,moderate-1)*5),0,100),items};
+  }
+
+  // ---- term builders ----
+  function tempTerm(s){ return maxOf(["coolant","oilTemp","transTemp"].map(k=>{
+    const sg=CONFIG.signals[k]; return signalBadness(s[k],sg.normal,sg.critical,sg.dir); }).filter(v=>v!=null)); }
+  function pressureTerm(s){ return maxOf(["oilPressure","fuelPressure","boost"].map(k=>{
+    const sg=CONFIG.signals[k]; return signalBadness(s[k],sg.normal,sg.critical,sg.dir); }).filter(v=>v!=null)); }
+  function usageTerm(s,harshCount){
+    const parts=[];
+    if(s.fuelTotal!=null&&s.fuelIdle!=null&&s.fuelTotal>0){ const r=s.fuelIdle/s.fuelTotal,c=CONFIG.idleRatio;
+      parts.push(r<=c.normal?0:r>=c.critical?100:clamp((r-c.normal)/(c.critical-c.normal)*100,0,100)); }
+    if(harshCount!=null){ const h=CONFIG.harshRate;
+      parts.push(harshCount<=h.normal?0:harshCount>=h.critical?100:clamp((harshCount-h.normal)/(h.critical-h.normal)*100,0,100)); }
+    return parts.length?Math.max.apply(null,parts):null;
+  }
+  function maintTerm(s,openDefects){
+    const parts=[];
+    if(openDefects!=null)parts.push(openDefects<=0?0:clamp(40+(openDefects-1)*30,0,100));
+    const ol=CONFIG.signals.oilLife; const olb=signalBadness(s.oilLife,ol.normal,ol.critical,ol.dir); if(olb!=null)parts.push(olb);
+    if(s.milDistance!=null)parts.push(s.milDistance>0?60:0);
+    return parts.length?Math.max.apply(null,parts):null;
+  }
+  function batteryTerm(s,batteryFaultOcc){
+    const parts=[];
+    const dv=CONFIG.signals.deviceVoltage; const dvb=signalBadness(s.deviceVoltage,dv.normal,dv.critical,dv.dir); if(dvb!=null)parts.push(dvb);
+    const cr=CONFIG.signals.cranking; const crb=signalBadness(s.cranking,cr.normal,cr.critical,cr.dir); if(crb!=null)parts.push(crb);
+    if(batteryFaultOcc>0)parts.push(clamp(40+batteryFaultOcc*3,0,100));
+    return parts.length?Math.max.apply(null,parts):null;
+  }
+
+  function combine(terms){ let w=0,a=0; for(const k in CONFIG.weights){ const v=terms[k]; if(v==null)continue; w+=CONFIG.weights[k]; a+=CONFIG.weights[k]*v; } return w===0?null:a/w; }
+  function band(score){ if(score==null)return ["Unknown","vhs-b-unknown"]; for(const b of CONFIG.bands) if(score>=b[0])return [b[1],b[2]]; return ["Normal","vhs-b-normal"]; }
+  function disposition(items,batteryScore){
+    if(items.some(i=>i.domState==="Active"&&i.worstLamp>=100))return "Remove from service";
+    if(items.some(i=>i.domState==="Active"&&(i.worstLamp>=60||(i.worstSeverity||0)>=60||(i.maxRisk||0)>=CONFIG.riskServiceNow||i.safety)))return "Service now";
+    let d=items.length?"Monitor":"OK";
+    if(items.some(i=>i.domState==="Pending"&&(i.worstSeverity||0)>=25)||items.some(i=>i.domState==="Active"))d="Schedule diagnostic";
+    else if(items.some(i=>i.intermittent))d="Watch \u2013 intermittent";
+    if((d==="OK"||d==="Monitor")&&batteryScore!=null&&batteryScore>=60)d="Schedule diagnostic";
+    return d;
+  }
+
+  // ---- emissions (Section 2) ----
+  function emissionsHealth(s){
+    const detail=[], parts=[];
+    const milOn = s.milDistance!=null && s.milDistance>0;
+    if(milOn){ parts.push(80); detail.push("Check-engine (MIL) on; driven "+Math.round(s.milDistance)+" m with it on"); }
+    // heavy-duty aftertreatment
+    const dpf=signalBadness(s.dpfSoot,CONFIG.signals.dpfSoot.normal,CONFIG.signals.dpfSoot.critical,"high");
+    if(dpf!=null){ parts.push(dpf); detail.push("DPF soot load "+Math.round(s.dpfSoot)+"%"); }
+    const def=signalBadness(s.defLevel,CONFIG.signals.defLevel.normal,CONFIG.signals.defLevel.critical,"low");
+    if(def!=null){ parts.push(def); detail.push("DEF level "+Math.round(s.defLevel)+"%"); }
+    if(s.noxIn!=null&&s.noxOut!=null&&s.noxIn>0){ const ratio=s.noxOut/s.noxIn; const b=ratio<=0.3?0:ratio>=0.8?100:clamp((ratio-0.3)/0.5*100,0,100);
+      parts.push(b); detail.push("NOx out/in ratio "+ratio.toFixed(2)+" (SCR efficiency)"); }
+    // monitor readiness
+    const mons=["monCatalyst","monO2","monEGR","monMisfire"]; let incomplete=0,have=0;
+    mons.forEach(k=>{ const v=s[k]; if(v!=null){ have++; if(v===0)incomplete++; } });
+    if(incomplete>0){ parts.push(Math.min(30,incomplete*10)); detail.push(incomplete+" of "+have+" OBD monitors incomplete"); }
+    const recentClear = s.distSinceClear!=null && s.distSinceClear>=0 && s.distSinceClear<16000; // <~10mi
+    if(recentClear && incomplete>0){ parts.push(40); detail.push("Codes cleared recently with monitors not yet complete \u2013 possible masking"); }
+    const score = parts.length?Math.max.apply(null,parts):(have>0||milOn===false?0:null);
+    let disp="OK";
+    if(score==null)disp="Unknown";
+    else if(milOn||(dpf!=null&&dpf>=100)||(def!=null&&def>=100))disp="Service emissions system";
+    else if((s.noxIn!=null&&s.noxOut!=null)&&score>=60)disp="Check SCR / aftertreatment";
+    else if(recentClear&&incomplete>0)disp="Recheck after drive cycle";
+    else if(score>=40)disp="Monitor";
+    return { score, disp, detail };
+  }
+  function co2Estimate(s){
+    const f=CONFIG.fuel.factorKgPerL[CONFIG.fuel.defaultType]||2.31;
+    if(s.fuelTotal==null)return null;
+    const total=s.fuelTotal*f, idle=(s.fuelIdle!=null?s.fuelIdle:0)*f;
+    const hrs=s.engineHours!=null?s.engineHours:(s.engineHoursAdj!=null?s.engineHoursAdj:null);
+    return { totalKg:total, idleKg:idle, perHour: hrs&&hrs>0? total/hrs : null,
+             idleWaste: s.fuelIdle!=null && s.fuelIdle>=CONFIG.fuel.idleWasteWarnL };
+  }
+
+  // ========================= data + render =========================
+  let API=null,STATE=null,NAME_BY_ID={},COMPUTED=[],TAB="breakdown";
+  const el=id=>document.getElementById(id);
+  const setMsg=t=>{ const m=el("vhs-msg"); if(m)m.textContent=t||""; };
+  const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const daysAgo=d=>new Date(Date.now()-d*864e5).toISOString();
+  function normGroups(state){ const raw=(state.getGroupFilter&&state.getGroupFilter())||[]; return raw.map(g=>typeof g==="string"?{id:g}:g).filter(g=>g&&g.id); }
+  const resolveId=kw=>{ const k=lc(kw); for(const id in NAME_BY_ID) if(lc(NAME_BY_ID[id]).indexOf(k)>-1)return id; return null; };
+
+  function run(){
+    const btn=el("vhs-refresh"); btn.disabled=true; setMsg("Loading vehicles, faults, events\u2026");
+    const groups=normGroups(STATE); const deviceSearch=groups.length?{groups}:{};
+    const fFrom=daysAgo(Number(el("vhs-window").value)||CONFIG.faultLookbackDays);
+
+    API.multiCall([
+      ["Get",{typeName:"Device",search:deviceSearch,resultsLimit:CONFIG.maxDevices}],
+      ["Get",{typeName:"FaultData",search:{fromDate:fFrom},resultsLimit:CONFIG.faultLimit}],
+      ["Get",{typeName:"ExceptionEvent",search:{fromDate:fFrom},resultsLimit:CONFIG.exceptionLimit}],
+      ["Get",{typeName:"DVIRLog",search:{fromDate:fFrom},resultsLimit:CONFIG.dvirLimit}],
+      ["Get",{typeName:"Rule",resultsLimit:CONFIG.ruleLimit}],
+    ],([devices,faults,exceptions,dvirs,rules])=>{
+      if(!devices||!devices.length){ btn.disabled=false; setMsg("No vehicles for the current group filter."); COMPUTED=[]; renderActive(); return; }
+      const idSet=new Set(devices.map(d=>d.id));
+
+      // harsh rule ids
+      const harshRuleIds={}; (rules||[]).forEach(r=>{ if(CONFIG.harshRuleKeywords.some(k=>lc(r.name).indexOf(k)>-1))harshRuleIds[r.id]=1; });
+      const harshByDev={}; (exceptions||[]).forEach(e=>{ const dv=e.device&&e.device.id, ru=e.rule&&e.rule.id;
+        if(dv&&idSet.has(dv)&&ru&&harshRuleIds[ru])harshByDev[dv]=(harshByDev[dv]||0)+1; });
+
+      // open DVIR defects per device (best-effort across schema shapes)
+      const defectsByDev={}; (dvirs||[]).forEach(l=>{ const dv=l.device&&l.device.id; if(!dv||!idSet.has(dv))return;
+        const list=l.defects||l.dvirDefects||[]; let open=0;
+        list.forEach(d=>{ const rs=lc((d&&(d.repairStatus||(d.defect&&d.defect.repairStatus)))||""); if(rs===""||rs.indexOf("notrepaired")>-1||rs.indexOf("repairrequired")>-1)open++; });
+        if(l.isSafeToOperate===false&&!list.length)open=Math.max(open,1);
+        defectsByDev[dv]=(defectsByDev[dv]||0)+open; });
+
+      // classify + bucket faults
+      const perDev={}; devices.forEach(d=>perDev[d.id]={vehicle:[],battery:[],device:[]});
+      const faultDiagIds=[],seen={};
+      (faults||[]).forEach(f=>{ const dv=f.device&&f.device.id; if(!dv||!idSet.has(dv))return;
+        const id=f.diagnostic&&f.diagnostic.id; if(id&&!seen[id]){seen[id]=1;faultDiagIds.push(id);} });
+
+      const proceed=()=>{
+        (faults||[]).forEach(f=>{ const dv=f.device&&f.device.id; if(!dv||!idSet.has(dv))return;
+          const name=NAME_BY_ID[(f.diagnostic&&f.diagnostic.id)]||""; perDev[dv][classify(f,name)].push(f); });
+
+        // resolve signal ids (configured id, else keyword) and fetch latest per device
+        const sigKeys=Object.keys(CONFIG.signals);
+        const sigId={}; sigKeys.forEach(k=>{ sigId[k]=CONFIG.signals[k].id||resolveId(CONFIG.signals[k].keyword); });
+        const active=sigKeys.filter(k=>sigId[k]);
+        const calls=[],idx=[],sFrom=daysAgo(CONFIG.statusLookbackDays);
+        devices.forEach(dev=>active.forEach(k=>{ calls.push(["Get",{typeName:"StatusData",
+          search:{deviceSearch:{id:dev.id},diagnosticSearch:{id:sigId[k]},fromDate:sFrom},resultsLimit:50}]); idx.push({dev:dev.id,key:k}); }));
+
+        const finish=latestBy=>{
+          COMPUTED=devices.map(dev=>{
+            const b=perDev[dev.id], s=latestBy[dev.id]||{};
+            const dtc=dtcTerm(groupByDiagnostic(b.vehicle,NAME_BY_ID));
+            const battOcc=b.battery.length;
+            const terms={ DTC:dtc.score, T:tempTerm(s), P:pressureTerm(s),
+              U:usageTerm(s,harshByDev[dev.id]!=null?harshByDev[dev.id]:null),
+              M:maintTerm(s,defectsByDev[dev.id]!=null?defectsByDev[dev.id]:null), B:batteryTerm(s,battOcc) };
+            const score=combine(terms);
+            const em=emissionsHealth(s); const co2=co2Estimate(s);
+            return { name:dev.name||dev.id, score, terms, disp:score==null?"Unknown":disposition(dtc.items,terms.B),
+              items:dtc.items, battOcc, deviceFaultCount:b.device.length,
+              harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, em, co2 };
+          });
+          btn.disabled=false; renderActive();
+          setMsg(COMPUTED.length+" vehicle(s) \u00b7 fault window "+el("vhs-window").value+" days \u00b7 "+active.length+" signals resolved");
+        };
+
+        if(!calls.length){ finish({}); return; }
+        setMsg("Loading "+calls.length+" signal readings\u2026");
+        API.multiCall(calls,results=>{ const by={};
+          results.forEach((rows,i)=>{ const {dev,key}=idx[i]; if(!rows||!rows.length)return;
+            const newest=rows.reduce((a,b)=>new Date(a.dateTime)>new Date(b.dateTime)?a:b);
+            (by[dev]=by[dev]||{})[key]=newest.data; });
+          finish(by);
+        },fail);
+      };
+
+      NAME_BY_ID={};
+      if(faultDiagIds.length){ API.call("Get",{typeName:"Diagnostic",search:{ids:faultDiagIds}},diags=>{ (diags||[]).forEach(d=>{NAME_BY_ID[d.id]=d.name;}); proceed(); },fail); }
+      else proceed();
+    },fail);
+  }
+
+  // ---- rendering ----
+  const tcell=v=> v==null?'<td class="vhs-term vhs-na vhs-num">\u2014</td>':'<td class="vhs-term vhs-num">'+Math.round(v)+'</td>';
+
+  function breakdownDetail(r){
+    const rows=r.items.length?r.items.map(i=>'<tr><td>'+esc(i.name)+(i.safety?' \u26a0 safety':'')+'</td><td>'+i.domState+(i.intermittent?' (intermittent)':'')
+      +'</td><td>'+(i.worstSeverity!=null?Math.round(i.worstSeverity):"\u2014")+'</td><td>'+(i.maxRisk!=null?i.maxRisk.toFixed(1)+"%":"\u2014")
+      +'</td><td>'+i.occurrences+'</td><td>'+Math.round(i.contribution)+'</td></tr>').join("")
+      :'<tr><td colspan="6" class="vhs-term">No vehicle ECU faults.</td></tr>';
+    let x="";
+    if(r.battOcc)x+='<div class="vhs-term" style="margin-top:6px;">Electrical: '+r.battOcc+' battery/low-voltage record(s) \u2192 B term.</div>';
+    if(r.harsh)x+='<div class="vhs-term">Harsh-driving events in window: '+r.harsh+' \u2192 U term.</div>';
+    if(r.openDefects)x+='<div class="vhs-term">Open DVIR defect(s): '+r.openDefects+' \u2192 M term.</div>';
+    if(r.deviceFaultCount)x+='<div class="vhs-term">Device/data-quality: '+r.deviceFaultCount+' GO-device record(s) (excluded from score).</div>';
+    return '<table><thead><tr><th>Vehicle fault</th><th>State</th><th>Severity</th><th>Risk</th><th>Count</th><th>Score</th></tr></thead><tbody>'+rows+'</tbody></table>'+x;
+  }
+  function emissionsDetail(r){
+    const lines=r.em.detail.length?r.em.detail.map(d=>'<div class="vhs-term">\u2022 '+esc(d)+'</div>').join(""):'<div class="vhs-term">No emissions issues detected from available signals.</div>';
+    let c="";
+    if(r.co2)c='<div class="vhs-term" style="margin-top:6px;">Est. CO\u2082 (fuel-derived): '+Math.round(r.co2.totalKg)+' kg total \u00b7 '+Math.round(r.co2.idleKg)+' kg from idling'
+      +(r.co2.perHour!=null?' \u00b7 '+r.co2.perHour.toFixed(2)+' kg/engine-hr':'')+(r.co2.idleWaste?' \u26a0 high idle waste':'')+'. Estimate only \u2014 use Geotab Sustainability Center for certified figures.</div>';
+    return lines+c;
+  }
+  function renderTable(getCols,getDetail){
+    const body=COMPUTED.map((r,i)=>'<tr class="vhs-row" data-i="'+i+'"><td><span class="vhs-caret">\u25b8</span>'+esc(r.name)
+      +(r.deviceFaultCount?'<span class="vhs-flag">device \u26a0</span>':'')+'</td>'+getCols(r)+'</tr>'
+      +'<tr class="vhs-detail" data-detail="'+i+'" style="display:none;"><td colspan="20">'+getDetail(r)+'</td></tr>').join("");
+    return body;
+  }
+  function renderActive(){
+    const out=el("vhs-out"); if(!out)return;
+    if(!COMPUTED.length){ out.innerHTML='<p class="vhs-msg">No data.</p>'; return; }
+    let head,body;
+    if(TAB==="breakdown"){
+      COMPUTED.sort((a,b)=>(b.score==null?-1:b.score)-(a.score==null?-1:a.score));
+      head='<th>Vehicle</th><th>Score</th><th>Status</th><th>Disposition</th><th>DTC</th><th>T</th><th>P</th><th>U</th><th>M</th><th>B</th>';
+      body=renderTable(r=>{ const bd=band(r.score); return '<td class="vhs-num"><span class="vhs-score">'+(r.score==null?"\u2014":Math.round(r.score))+'</span></td>'
+        +'<td><span class="vhs-band '+bd[1]+'">'+bd[0]+'</span></td><td class="vhs-disp">'+r.disp+'</td>'
+        +tcell(r.terms.DTC)+tcell(r.terms.T)+tcell(r.terms.P)+tcell(r.terms.U)+tcell(r.terms.M)+tcell(r.terms.B); }, breakdownDetail);
+    } else {
+      COMPUTED.sort((a,b)=>(b.em.score==null?-1:b.em.score)-(a.em.score==null?-1:a.em.score));
+      head='<th>Vehicle</th><th>Emissions health</th><th>Status</th><th>Disposition</th><th>Est. CO\u2082 (kg)</th>';
+      body=renderTable(r=>{ const bd=band(r.em.score); return '<td class="vhs-num"><span class="vhs-score">'+(r.em.score==null?"\u2014":Math.round(r.em.score))+'</span></td>'
+        +'<td><span class="vhs-band '+bd[1]+'">'+bd[0]+'</span></td><td class="vhs-disp">'+r.em.disp+'</td>'
+        +'<td class="vhs-num">'+(r.co2?Math.round(r.co2.totalKg):"\u2014")+'</td>'; }, emissionsDetail);
+    }
+    out.innerHTML='<table class="vhs-table"><thead><tr>'+head+'</tr></thead><tbody>'+body+'</tbody></table>'
+      +'<div class="vhs-note">Click any row for detail. Scores are calibration starting points \u2014 tune thresholds in CONFIG. CO\u2082 is a fuel-derived estimate, not certified.</div>';
+    out.querySelectorAll(".vhs-row").forEach(row=>row.addEventListener("click",()=>{ const d=out.querySelector('[data-detail="'+row.getAttribute("data-i")+'"]'); if(d)d.style.display=d.style.display==="none"?"":"none"; }));
+  }
+  function setTab(t){ TAB=t; el("vhs-tab-bd").classList.toggle("vhs-on",t==="breakdown"); el("vhs-tab-em").classList.toggle("vhs-on",t==="emissions"); renderActive(); }
+  function fail(err){ const b=el("vhs-refresh"); if(b)b.disabled=false; setMsg("Error: "+(err&&err.message?err.message:String(err))); console.error("[VehicleHealth]",err); }
+
+  // ========================= lifecycle =========================
+  return {
+    initialize(api,state,callback){ API=api; STATE=state;
+      el("vhs-window").value=String(CONFIG.faultLookbackDays);
+      el("vhs-refresh").addEventListener("click",run);
+      el("vhs-tab-bd").addEventListener("click",()=>setTab("breakdown"));
+      el("vhs-tab-em").addEventListener("click",()=>setTab("emissions"));
+      callback();
+    },
+    focus(api,state){ API=api; STATE=state; run(); },
+    blur(){ const o=el("vhs-out"); if(o)o.innerHTML=""; }
+  };
+};
+</script>
+</head>
+<body>
+  <div id="vhs-root">
+    <h1>Vehicle Health</h1>
+    <p class="vhs-sub">Operational health for the current group filter. Higher score = higher concern. Click a row for detail.</p>
+    <div class="vhs-tabs">
+      <button id="vhs-tab-bd" class="vhs-tab vhs-on" type="button">Breakdown Risk</button>
+      <button id="vhs-tab-em" class="vhs-tab" type="button">Emissions Health</button>
+    </div>
+    <div class="vhs-controls">
+      <label for="vhs-window">Window</label>
+      <select id="vhs-window"><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option><option value="90">90 days</option></select>
+      <button id="vhs-refresh" type="button">Refresh</button>
+    </div>
+    <p id="vhs-msg" class="vhs-msg"></p>
+    <div id="vhs-out"></div>
+  </div>
+</body>
+</html>
