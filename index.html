@@ -1,81 +1,260 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>Vehicle Health</title>
-
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Vehicle health — Lytx+ with Geotab</title>
 <!--
-  ============================================================================
-  VEHICLE HEALTH  -  Geotab custom-page Add-in (v3, two sections)
-  ============================================================================
-  SECTION 1  Breakdown Risk Score = 0.30 DTC + 0.20 T + 0.15 P + 0.15 U + 0.10 M + 0.10 B
-  SECTION 2  Emissions-system health (light-duty MIL/readiness + heavy-duty aftertreatment)
-
-  DESIGN PRINCIPLE: this is a framework you tune, not rework. Every signal,
-  threshold and weight lives in CONFIG. Every term/section detects what each
-  vehicle reports and scores only what is present, re-normalizing around what
-  is missing. Adding a signal = one CONFIG line. Re-calibrating = edit a number.
-
-  DATA SOURCES used:
-    FaultData      -> DTC term (native severity/riskOfBreakdown/lamp/state) + battery + device split
-    StatusData     -> coolant, voltages, fuel, MIL distance, codes-cleared, monitors,
-                      engine hours, oil life, and heavy-duty DPF/DEF/NOx/EGR (when present)
-    ExceptionEvent -> harsh-driving events (U term), matched to harsh rules by name
-    DVIRLog        -> open inspection defects (M term)
-
-  VALIDATED on the test fleet: DTC classification + scoring (battery->B, device
-  excluded, vehicle->DTC), bands. NOT yet validated (confirm by loading): harsh
-  events, DVIR defects, engine hours, oil life, and Section 2 signals - these are
-  wired with graceful fallback and contribute only where data exists.
-
-  NOT built (data this vehicle type cannot provide / certified elsewhere):
-    - catalyst O2-variance / converter-degradation model (no O2 voltages; curve
-      logging kills variance) -> replaced by MIL/readiness + aftertreatment health
-    - certified CO2/GHG accounting -> use Geotab Sustainability Center; the CO2 here
-      is a fuel-derived ESTIMATE for the operational view only
-  ============================================================================
+  VEHICLE HEALTH — Geotab custom-page add-in (v4 UI, Lytx-branded).
+  Scoring engine UNCHANGED from validated v3 (see index.v3.backup.html). This file
+  rebuilds the interface only. Folded-in decisions: (1) formula left as-is, list
+  triaged by DISPOSITION urgency; (2) CO2/engine-hour now a windowed fuel/hours
+  delta with seconds->hours auto-detection; (3) assets reporting nothing show "No data".
+  Brand: Lytx palette + Open Sans. Logo is NOT recreated — text wordmark with a slot
+  for the official asset (see .vh-brand in body) + required attribution in footer.
 -->
-
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300..800;1,400&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --vhs-fg:#1f2933; --vhs-muted:#6b7785; --vhs-line:#e3e8ee; --vhs-bg:#fff;
-    --vhs-b-normal:#2e7d32; --vhs-b-monitor:#9e9d24; --vhs-b-inspect:#ef6c00;
-    --vhs-b-priority:#d84315; --vhs-b-high:#b71c1c; --vhs-unknown:#90a4ae; --vhs-accent:#1565c0;
+  #vh-app {
+    --c-darkblue:#1F1446; --c-lightblue:#009CDE; --c-lightblue-2:#6ED4FF;
+    --c-red:#CF4520; --c-orange:#E87722; --c-amber:#E8A722; --c-green:#84BD00;
+    --c-teal:#00859B; --c-cerulean:#407EC9; --c-purple:#702082;
+    --c-mgray:#98A4AE; --c-lgray:#C5CFDA;
+    --bg:#120d29; --bg2:#171039; --panel:#1d1648; --panel-2:#241c5b; --panel-3:#2b2169;
+    --line:rgba(159,168,214,.14); --line-2:rgba(159,168,214,.22);
+    --fg:#ffffff; --fg-2:#cdd4e6; --fg-3:#9aa3c4;
+    --accent:var(--c-lightblue); --accent-2:var(--c-lightblue-2);
+    --r:12px; --r-sm:9px; --r-pill:999px;
+    --sh:0 10px 30px rgba(0,0,0,.38); --sh-sm:0 4px 14px rgba(0,0,0,.3);
+    --ease:cubic-bezier(.22,.61,.36,1);
+    font-family:'Open Sans',system-ui,-apple-system,"Segoe UI",Arial,sans-serif;
+    font-size:13.5px; color:var(--fg); line-height:1.45;
+    background:
+      radial-gradient(1100px 520px at 88% -8%, rgba(0,156,222,.16), transparent 60%),
+      radial-gradient(900px 480px at -6% 8%, rgba(112,32,130,.16), transparent 55%),
+      linear-gradient(180deg,var(--bg2) 0%,var(--bg) 100%);
+    min-height:100vh; -webkit-font-smoothing:antialiased;
   }
-  #vhs-root { font-family:system-ui,-apple-system,"Segoe UI",sans-serif; color:var(--vhs-fg); font-size:13px; padding:16px 18px; }
-  #vhs-root h1 { font-size:16px; font-weight:600; margin:0 0 2px; }
-  .vhs-sub { color:var(--vhs-muted); margin:0 0 12px; }
-  .vhs-tabs { display:flex; gap:4px; margin-bottom:12px; border-bottom:1px solid var(--vhs-line); }
-  .vhs-tab { font:inherit; padding:7px 14px; border:none; background:none; color:var(--vhs-muted);
-             cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-1px; }
-  .vhs-tab.vhs-on { color:var(--vhs-accent); border-bottom-color:var(--vhs-accent); font-weight:600; }
-  .vhs-controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
-  .vhs-controls label { color:var(--vhs-muted); }
-  .vhs-controls select,.vhs-controls button { font:inherit; padding:5px 10px; border:1px solid var(--vhs-line);
-      border-radius:6px; background:var(--vhs-bg); color:var(--vhs-fg); cursor:pointer; }
-  .vhs-controls button { background:var(--vhs-accent); color:#fff; border-color:var(--vhs-accent); }
-  .vhs-controls button:disabled { opacity:.55; cursor:default; }
-  .vhs-msg { color:var(--vhs-muted); margin:8px 0; }
-  table.vhs-table { border-collapse:collapse; width:100%; }
-  .vhs-table th,.vhs-table td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--vhs-line); white-space:nowrap; }
-  .vhs-table th { color:var(--vhs-muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
-  .vhs-num { font-variant-numeric:tabular-nums; }
-  .vhs-score { font-weight:700; font-size:15px; }
-  .vhs-band { display:inline-block; padding:2px 9px; border-radius:11px; color:#fff; font-size:11px; font-weight:600; }
-  .vhs-b-normal{background:var(--vhs-b-normal)} .vhs-b-monitor{background:var(--vhs-b-monitor)}
-  .vhs-b-inspect{background:var(--vhs-b-inspect)} .vhs-b-priority{background:var(--vhs-b-priority)}
-  .vhs-b-high{background:var(--vhs-b-high)} .vhs-b-unknown{background:var(--vhs-unknown)}
-  .vhs-disp { font-weight:600; }
-  .vhs-row { cursor:pointer; } .vhs-row:hover { background:#f7f9fb; }
-  .vhs-term { color:var(--vhs-muted); } .vhs-term.vhs-na { opacity:.4; }
-  .vhs-flag { display:inline-block; font-size:11px; padding:1px 6px; border-radius:4px; background:#eceff1; color:var(--vhs-muted); margin-left:6px; }
-  .vhs-detail td { background:#fafcfe; }
-  .vhs-detail table { width:100%; border-collapse:collapse; font-size:12px; }
-  .vhs-detail th,.vhs-detail td { padding:4px 8px; border-bottom:1px solid #eef2f6; white-space:normal; }
-  .vhs-caret { color:var(--vhs-muted); margin-right:6px; }
-  .vhs-note { font-size:11px; color:var(--vhs-muted); margin-top:10px; }
-</style>
+  #vh-app *{ box-sizing:border-box; }
+  #vh-app .num{ font-variant-numeric:tabular-nums; }
+  #vh-app button{ font-family:inherit; }
+  #vh-app ::selection{ background:rgba(0,156,222,.32); }
+  #vh-app :focus-visible{ outline:2px solid var(--accent-2); outline-offset:2px; border-radius:6px; }
 
+  .vh-header{ position:relative; display:flex; align-items:center; gap:22px; flex-wrap:wrap;
+    padding:16px 24px; border-bottom:1px solid var(--line-2);
+    background:linear-gradient(102deg,#1a1245 0%,#241a5e 46%,#2c3f86 132%);
+    box-shadow:0 1px 0 rgba(255,255,255,.05) inset; }
+  .vh-header::after{ content:""; position:absolute; left:0; right:0; bottom:-1px; height:2px;
+    background:linear-gradient(90deg,var(--c-lightblue-2),var(--c-lightblue) 40%,transparent); opacity:.9; }
+  .vh-brand{ display:flex; align-items:center; gap:12px; padding-right:20px; border-right:1px solid var(--line-2); }
+  .vh-brand-mark{ font-weight:800; font-size:21px; letter-spacing:-.01em; color:#fff; line-height:1; }
+  .vh-brand-mark .vh-plus{ color:var(--c-lightblue-2); }
+  .vh-brand-sub{ font-size:12px; font-weight:600; color:var(--c-lgray); letter-spacing:.02em; }
+  .vh-brand-sep{ width:1px; height:20px; background:var(--c-mgray); opacity:.5; border-radius:2px; }
+  .vh-head-titles{ margin-right:auto; }
+  .vh-head-titles h1{ margin:0; font-size:18px; font-weight:700; letter-spacing:-.01em; }
+  .vh-head-titles p{ margin:1px 0 0; font-size:12.5px; color:var(--fg-3); }
+  .vh-head-controls{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+
+  .vh-seg{ display:inline-flex; padding:3px; background:rgba(0,0,0,.26); border:1px solid var(--line); border-radius:var(--r-pill); }
+  .vh-seg button{ border:none; background:none; color:var(--fg-2); cursor:pointer; font-size:13px; font-weight:600;
+    padding:7px 16px; border-radius:var(--r-pill); transition:color .18s, background .18s; white-space:nowrap; }
+  .vh-seg button:hover{ color:#fff; }
+  .vh-seg button.on{ color:#0c1330; background:linear-gradient(180deg,#fff,#dbe9ff); box-shadow:0 2px 8px rgba(0,0,0,.28); }
+
+  .vh-field{ display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--fg-3); }
+  .vh-field select{ font-family:inherit; font-size:13px; color:var(--fg); background:rgba(0,0,0,.24);
+    border:1px solid var(--line-2); border-radius:var(--r-sm); padding:7px 10px; cursor:pointer; }
+  .vh-field select:hover{ border-color:var(--accent); }
+  .vh-btn{ display:inline-flex; align-items:center; gap:7px; font-size:13px; font-weight:700; color:#06243a;
+    background:linear-gradient(180deg,var(--c-lightblue-2),var(--c-lightblue)); border:none; cursor:pointer;
+    padding:8px 16px; border-radius:var(--r-sm); box-shadow:0 4px 14px rgba(0,156,222,.32);
+    transition:transform .14s var(--ease), box-shadow .14s, filter .14s; }
+  .vh-btn:hover{ filter:brightness(1.06); box-shadow:0 6px 18px rgba(0,156,222,.42); }
+  .vh-btn:active{ transform:translateY(1px); }
+  .vh-btn:disabled{ opacity:.5; cursor:default; filter:none; box-shadow:none; transform:none; }
+  .vh-btn-ghost{ color:var(--fg-2); background:rgba(255,255,255,.06); border:1px solid var(--line-2); box-shadow:none; }
+  .vh-btn-ghost:hover{ color:#fff; background:rgba(255,255,255,.1); filter:none; box-shadow:none; }
+
+  .vh-main{ padding:22px 24px 8px; }
+  .vh-status{ font-size:12px; color:var(--fg-3); margin:0 2px 14px; min-height:16px; }
+  .vh-status b{ color:var(--fg-2); font-weight:700; }
+
+  .vh-summary{ margin-bottom:20px; }
+  .vh-kpis{ display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
+  @media (max-width:880px){ .vh-kpis{ grid-template-columns:repeat(2,1fr);} }
+  .vh-kpi{ position:relative; text-align:left; cursor:pointer; overflow:hidden;
+    padding:16px 16px 15px; border-radius:var(--r); border:1px solid var(--line);
+    background:linear-gradient(180deg,var(--panel-2),var(--panel)); box-shadow:var(--sh-sm);
+    transition:transform .16s var(--ease), border-color .16s, box-shadow .16s;
+    opacity:0; transform:translateY(8px); animation:vh-rise .42s var(--ease) forwards; }
+  .vh-kpi:hover{ transform:translateY(-2px); border-color:var(--line-2); box-shadow:var(--sh); }
+  .vh-kpi::before{ content:""; position:absolute; left:0; top:0; bottom:0; width:4px; background:var(--kc,var(--accent)); }
+  .vh-kpi.sel{ border-color:var(--kc,var(--accent)); box-shadow:0 0 0 1px var(--kc,var(--accent)), var(--sh); }
+  .vh-kpi .kl{ font-size:11.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--fg-3); }
+  .vh-kpi .kn{ font-size:34px; font-weight:800; line-height:1.04; margin-top:6px; letter-spacing:-.02em; color:#fff; }
+  .vh-kpi .kp{ font-size:12px; color:var(--fg-3); margin-top:3px; }
+  .vh-kpi .kp b{ color:var(--kc,var(--accent)); font-weight:700; }
+  .vh-kpi .kdot{ position:absolute; top:15px; right:15px; width:9px; height:9px; border-radius:50%;
+    background:var(--kc,var(--accent)); box-shadow:0 0 0 4px color-mix(in srgb,var(--kc,var(--accent)) 22%,transparent); }
+
+  .vh-dist{ margin-top:16px; padding:15px 16px; border-radius:var(--r); border:1px solid var(--line);
+    background:linear-gradient(180deg,var(--panel),var(--bg2)); }
+  .vh-dist-top{ display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:11px; }
+  .vh-dist-top .t{ font-size:12px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--fg-3); }
+  .vh-dist-top .co2{ font-size:12.5px; color:var(--fg-2); }
+  .vh-dist-top .co2 b{ color:#fff; font-weight:800; font-size:15px; }
+  .vh-bar{ display:flex; height:12px; border-radius:var(--r-pill); overflow:hidden; background:rgba(0,0,0,.3); }
+  .vh-bar i{ display:block; height:100%; cursor:pointer; width:0; transition:width .6s var(--ease), filter .15s; }
+  .vh-bar i:hover{ filter:brightness(1.18); }
+  .vh-legend{ display:flex; flex-wrap:wrap; gap:8px 16px; margin-top:12px; }
+  .vh-leg{ display:inline-flex; align-items:center; gap:7px; font-size:12px; color:var(--fg-2); cursor:pointer;
+    background:none; border:none; padding:2px 0; transition:color .15s; }
+  .vh-leg:hover{ color:#fff; }
+  .vh-leg .sw{ width:10px; height:10px; border-radius:3px; }
+  .vh-leg b{ color:#fff; font-weight:700; }
+
+  .vh-panel{ border:1px solid var(--line); border-radius:var(--r); background:var(--panel); box-shadow:var(--sh); overflow:hidden; }
+  .vh-panel-head{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; padding:15px 18px;
+    border-bottom:1px solid var(--line); background:linear-gradient(180deg,var(--panel-2),var(--panel)); }
+  .vh-panel-head h2{ margin:0; font-size:14.5px; font-weight:700; }
+  .vh-count{ font-size:12px; color:var(--fg-3); margin-left:9px; font-weight:600; }
+  .vh-tools{ display:flex; align-items:center; gap:10px; margin-left:auto; flex-wrap:wrap; }
+  .vh-search{ position:relative; }
+  .vh-search input{ font-family:inherit; font-size:13px; color:var(--fg); width:190px;
+    background:rgba(0,0,0,.26); border:1px solid var(--line-2); border-radius:var(--r-sm); padding:8px 11px 8px 31px; }
+  .vh-search input::placeholder{ color:var(--fg-3); }
+  .vh-search input:focus{ border-color:var(--accent); outline:none; }
+  .vh-search svg{ position:absolute; left:9px; top:50%; transform:translateY(-50%); opacity:.55; }
+
+  .vh-filters{ display:flex; gap:7px; flex-wrap:wrap; }
+  .vh-fpill{ font-family:inherit; font-size:12px; font-weight:600; color:var(--fg-2); cursor:pointer;
+    background:rgba(255,255,255,.05); border:1px solid var(--line-2); border-radius:var(--r-pill);
+    padding:5px 12px; transition:all .15s; white-space:nowrap; }
+  .vh-fpill:hover{ color:#fff; background:rgba(255,255,255,.09); }
+  .vh-fpill .c{ opacity:.7; font-weight:700; margin-left:5px; }
+  .vh-fpill.on{ color:#fff; background:rgba(0,156,222,.18); border-color:var(--accent); }
+
+  .vh-tablewrap{ max-height:560px; overflow:auto; }
+  .vh-table{ width:100%; border-collapse:collapse; }
+  .vh-table thead th{ position:sticky; top:0; z-index:2; text-align:left; white-space:nowrap;
+    font-size:11px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--fg-3);
+    padding:11px 16px; background:#1a1444; border-bottom:1px solid var(--line-2); user-select:none; }
+  .vh-table th.srt{ cursor:pointer; }
+  .vh-table th.srt:hover{ color:var(--fg); }
+  .vh-table th .ar{ opacity:0; margin-left:5px; font-size:9px; transition:opacity .15s; }
+  .vh-table th.srt:hover .ar{ opacity:.5; }
+  .vh-table th.act .ar{ opacity:1; color:var(--accent-2); }
+  .vh-table tbody td{ padding:12px 16px; border-bottom:1px solid var(--line); white-space:nowrap; vertical-align:middle; }
+  .vh-tr{ cursor:pointer; transition:background .14s; }
+  .vh-tr:hover{ background:rgba(255,255,255,.035); }
+  .vh-tr:hover .vh-chev{ color:var(--accent-2); transform:translateX(2px); }
+  .vh-tr.nodata{ opacity:.62; }
+  .vh-veh{ font-weight:600; }
+  .vh-vehname{ color:#fff; }
+  .vh-tag{ display:inline-block; font-size:10px; font-weight:700; letter-spacing:.03em; text-transform:uppercase;
+    padding:2px 7px; border-radius:5px; margin-left:8px; vertical-align:middle; }
+  .vh-tag-dev{ color:#cdd4e6; background:rgba(152,164,174,.16); border:1px solid rgba(152,164,174,.32); }
+  .vh-chev{ color:var(--fg-3); font-size:17px; transition:transform .14s, color .14s; text-align:right; }
+
+  .vh-pill{ display:inline-block; font-size:11.5px; font-weight:700; padding:3px 11px; border-radius:var(--r-pill); border:1px solid transparent; white-space:nowrap; }
+  .pill-r{ color:#ff8a66; background:rgba(207,69,32,.18); border-color:rgba(207,69,32,.5); }
+  .pill-o{ color:#ff9d4d; background:rgba(232,119,34,.18); border-color:rgba(232,119,34,.5); }
+  .pill-a{ color:#f4c145; background:rgba(232,167,34,.18); border-color:rgba(232,167,34,.5); }
+  .pill-c{ color:#88b4f2; background:rgba(64,126,201,.20); border-color:rgba(64,126,201,.5); }
+  .pill-t{ color:#3cc6d8; background:rgba(0,133,155,.22); border-color:rgba(0,133,155,.55); }
+  .pill-g{ color:#b6e04e; background:rgba(132,189,0,.18); border-color:rgba(132,189,0,.5); }
+  .pill-x{ color:#aeb6cf; background:rgba(152,164,174,.16); border-color:rgba(152,164,174,.34); }
+
+  .vh-sc{ display:flex; flex-direction:column; gap:5px; min-width:96px; }
+  .vh-sc .n{ font-size:16px; font-weight:800; line-height:1; color:#fff; }
+  .vh-sc.na .n{ color:var(--fg-3); font-weight:600; }
+  .vh-sc .track{ height:5px; border-radius:3px; background:rgba(255,255,255,.09); overflow:hidden; }
+  .vh-sc .track i{ display:block; height:100%; border-radius:3px; }
+  .fb-g{ background:linear-gradient(90deg,#6fae00,#84BD00); }
+  .fb-a{ background:linear-gradient(90deg,#d99a1c,#E8A722); }
+  .fb-o{ background:linear-gradient(90deg,#d6651a,#E87722); }
+  .fb-r{ background:linear-gradient(90deg,#b83a18,#CF4520); }
+
+  .vh-bars{ display:flex; gap:5px; align-items:flex-end; }
+  .vh-fb{ display:flex; flex-direction:column; align-items:center; gap:4px; }
+  .vh-fb .tk{ position:relative; width:9px; height:30px; border-radius:3px; background:rgba(255,255,255,.07); overflow:hidden; }
+  .vh-fb .fl{ position:absolute; left:0; bottom:0; width:100%; border-radius:3px; }
+  .vh-fb b{ font-size:9.5px; font-weight:700; color:var(--fg-3); }
+  .vh-fb.na .tk{ background:rgba(255,255,255,.045); }
+  .vh-fb.na b{ opacity:.5; }
+
+  .vh-pager{ display:flex; align-items:center; gap:12px; padding:13px 18px; border-top:1px solid var(--line);
+    background:var(--panel-2); font-size:12.5px; color:var(--fg-3); }
+  .vh-pager .pinfo{ margin-right:auto; }
+  .vh-pager .pinfo b{ color:var(--fg-2); }
+  .vh-pg{ font-family:inherit; font-size:12.5px; font-weight:700; color:var(--fg-2); cursor:pointer;
+    background:rgba(255,255,255,.06); border:1px solid var(--line-2); border-radius:var(--r-sm); padding:6px 12px; transition:all .15s; }
+  .vh-pg:hover:not(:disabled){ color:#fff; background:rgba(255,255,255,.1); }
+  .vh-pg:disabled{ opacity:.4; cursor:default; }
+  .vh-pg-n{ color:var(--fg-2); }
+
+  .vh-state{ padding:54px 24px; text-align:center; color:var(--fg-3); }
+  .vh-state .ico{ font-size:30px; opacity:.5; }
+  .vh-state .t{ font-size:15px; font-weight:700; color:var(--fg-2); margin-top:10px; }
+  .vh-state .d{ font-size:13px; margin-top:5px; }
+  .vh-spin{ width:30px; height:30px; margin:0 auto; border:3px solid rgba(255,255,255,.12);
+    border-top-color:var(--accent-2); border-radius:50%; animation:vh-spin 1s linear infinite; }
+
+  .vh-footer{ padding:18px 24px 26px; margin-top:14px; border-top:1px solid var(--line); color:var(--fg-3); font-size:11px; }
+  .vh-footer .tag{ font-weight:700; letter-spacing:.07em; text-transform:uppercase; color:var(--fg-2); }
+  .vh-footer .note{ margin-top:7px; max-width:980px; line-height:1.6; }
+
+  .vh-scrim{ position:fixed; inset:0; background:rgba(8,6,22,.55); backdrop-filter:blur(2px);
+    opacity:0; pointer-events:none; transition:opacity .25s; z-index:40; }
+  .vh-scrim.on{ opacity:1; pointer-events:auto; }
+  .vh-drawer{ position:fixed; top:0; right:0; bottom:0; width:min(460px,94vw); z-index:41;
+    background:linear-gradient(180deg,var(--panel-2),var(--bg2)); border-left:1px solid var(--line-2);
+    box-shadow:-18px 0 50px rgba(0,0,0,.5); transform:translateX(102%); transition:transform .3s var(--ease);
+    display:flex; flex-direction:column; }
+  .vh-drawer.on{ transform:translateX(0); }
+  .vh-drawer-head{ padding:18px 20px; border-bottom:1px solid var(--line); }
+  .vh-drawer-head .row1{ display:flex; align-items:flex-start; gap:12px; }
+  .vh-drawer-head h3{ margin:0; font-size:17px; font-weight:800; }
+  .vh-drawer-head .sub{ font-size:12px; color:var(--fg-3); margin-top:2px; }
+  .vh-x{ margin-left:auto; background:rgba(255,255,255,.07); border:1px solid var(--line-2); color:var(--fg-2);
+    width:30px; height:30px; border-radius:8px; cursor:pointer; font-size:16px; line-height:1; transition:all .15s; flex:none; }
+  .vh-x:hover{ color:#fff; background:rgba(255,255,255,.12); }
+  .vh-drawer-head .meta{ display:flex; align-items:center; gap:12px; margin-top:13px; }
+  .vh-bigscore{ font-size:30px; font-weight:800; line-height:1; }
+  .vh-drawer-body{ padding:18px 20px; overflow:auto; }
+  .vh-sec{ margin-bottom:20px; }
+  .vh-sec > .h{ font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; color:var(--fg-3); margin-bottom:10px; }
+  .vh-terms{ display:flex; flex-direction:column; gap:9px; }
+  .vh-trm{ display:grid; grid-template-columns:96px 1fr 34px; align-items:center; gap:10px; font-size:12.5px; }
+  .vh-trm .lab{ color:var(--fg-2); }
+  .vh-trm .tk{ height:7px; border-radius:4px; background:rgba(255,255,255,.08); overflow:hidden; }
+  .vh-trm .tk i{ display:block; height:100%; border-radius:4px; }
+  .vh-trm .v{ text-align:right; font-weight:700; color:#fff; font-variant-numeric:tabular-nums; }
+  .vh-trm.na .v{ color:var(--fg-3); font-weight:500; }
+  .vh-dtable{ width:100%; border-collapse:collapse; font-size:12px; }
+  .vh-dtable th{ text-align:left; font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+    color:var(--fg-3); padding:6px 8px; border-bottom:1px solid var(--line-2); }
+  .vh-dtable td{ padding:7px 8px; border-bottom:1px solid var(--line); color:var(--fg-2); vertical-align:top; }
+  .vh-dtable td.num{ font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .vh-li{ font-size:12.5px; color:var(--fg-2); padding:7px 0 7px 16px; position:relative; border-bottom:1px solid var(--line); }
+  .vh-li::before{ content:""; position:absolute; left:2px; top:13px; width:6px; height:6px; border-radius:50%; background:var(--accent); }
+  .vh-li:last-child{ border-bottom:none; }
+  .vh-callout{ font-size:12px; color:var(--fg-2); background:rgba(0,156,222,.08); border:1px solid rgba(0,156,222,.22);
+    border-radius:var(--r-sm); padding:11px 13px; line-height:1.55; }
+  .vh-callout b{ color:#fff; }
+  .vh-muted{ color:var(--fg-3); }
+
+  @keyframes vh-rise{ to{ opacity:1; transform:translateY(0);} }
+  @keyframes vh-spin{ to{ transform:rotate(360deg);} }
+  @media (prefers-reduced-motion:reduce){
+    #vh-app *{ animation-duration:.001ms !important; transition-duration:.001ms !important; }
+    .vh-kpi{ opacity:1; transform:none; }
+  }
+</style>
 <script>
 geotab.addin.vehicleHealth = () => {
 
@@ -85,28 +264,18 @@ geotab.addin.vehicleHealth = () => {
     bands: [ [90,"High risk","vhs-b-high"], [75,"Priority maint.","vhs-b-priority"],
              [60,"Schedule inspection","vhs-b-inspect"], [40,"Monitor","vhs-b-monitor"],
              [0,"Normal","vhs-b-normal"] ],
-    maxDevices: 15, faultLookbackDays: 30, statusLookbackDays: 7,
-    faultLimit: 5000, exceptionLimit: 5000, dvirLimit: 1000, ruleLimit: 2000,
-
-    // ---- fault classification ----
+    maxDevices: 2000, faultLookbackDays: 30, statusLookbackDays: 7, pageSize: 25,
+    faultLimit: 50000, exceptionLimit: 50000, dvirLimit: 10000, ruleLimit: 2000, statusLimit: 500,
     batteryFaultKeywords: ["battery","low voltage"],
     deviceFaultKeywords:  ["device","restarted","power was removed","gps","antenna","tamper","telematics"],
     deviceControllerId:   "ControllerGoDeviceId",
     stateMultiplier: { Active:1.0, Pending:0.6, Inactive:0.2 },
     riskServiceNow: 40,
-    safetySystemKeywords: ["abs","brake","wheel speed","steering","stability"],  // elevate these
-
-    // ---- harsh-driving rules (U term), matched against Rule names ----
+    safetySystemKeywords: ["abs","brake","wheel speed","steering","stability"],
     harshRuleKeywords: ["harsh","aggressive","acceleration","braking","cornering"],
-    harshRate: { normal:2, critical:30 },   // events over the window: <=2 ok, >=30 worst
-
-    // ---- thresholds (calibrate to your fleet / units) ----
+    harshRate: { normal:20, critical:120 },
     idleRatio:    { normal:0.25, critical:0.60 },
     fuel: { factorKgPerL: { gasoline:2.31, diesel:2.68 }, defaultType:"gasoline", idleWasteWarnL:50 },
-
-    // ---- SIGNALS. id used directly (robust); keyword is fallback. dir high|low.
-    //      Heavy-duty signals have no id here on purpose - resolved by keyword if
-    //      a vehicle reports them; absent on light-duty -> simply skipped. ----
     signals: {
       coolant:      { id:"DiagnosticEngineCoolantTemperatureId", keyword:"engine coolant temperature", dir:"high", normal:105, critical:120, term:"T" },
       oilTemp:      { keyword:"engine oil temperature", dir:"high", normal:120, critical:140, term:"T" },
@@ -116,19 +285,17 @@ geotab.addin.vehicleHealth = () => {
       boost:        { keyword:"turbo boost", dir:"high", normal:200, critical:300, term:"P" },
       deviceVoltage:{ id:"DiagnosticGoDeviceVoltageId", keyword:"telematics device voltage", dir:"low", normal:12.2, critical:11.4, term:"B" },
       cranking:     { id:"DiagnosticCrankingVoltageId", keyword:"cranking voltage", dir:"low", normal:11.0, critical:9.0, term:"B" },
-      oilLife:      { keyword:"oil life", dir:"low", normal:30, critical:5, term:"M" }, // % remaining
+      oilLife:      { keyword:"oil life", dir:"low", normal:30, critical:5, term:"M" },
       fuelTotal:    { id:"DiagnosticDeviceTotalFuelId", keyword:"total fuel used (since" },
       fuelIdle:     { id:"DiagnosticDeviceTotalIdleFuelId", keyword:"total fuel used while idling" },
       engineHours:  { id:"DiagnosticEngineHoursId", keyword:"engine hours" },
       engineHoursAdj:{ id:"DiagnosticEngineHoursAdjustmentId", keyword:"engine hours" },
-      // emissions
-      milDistance:  { id:"ak0pLOA92RkSyQDvovh8Afg", keyword:"malfunction indicator lamp (mil) on" }, // hashed ids here are THIS fleet's; re-discover per vehicle type
+      milDistance:  { id:"ak0pLOA92RkSyQDvovh8Afg", keyword:"malfunction indicator lamp (mil) on" },
       distSinceClear:{ id:"aKpyOK5cMZkmSE_isEqk8iA", keyword:"distance traveled since codes cleared" },
       monCatalyst:  { id:"a-dPsmgsMg0OiBKjmQASXWQ", keyword:"catalyst monitor complete" },
       monO2:        { id:"aQlf26vuLj06djxfNj-9rIQ", keyword:"oxygen sensor monitor complete" },
       monEGR:       { id:"a2cJr2HdL9UiQeEcvYL_Wkw", keyword:"egr system monitor complete" },
       monMisfire:   { id:"aDn7Ky78pnUmai2B3dmPmqQ", keyword:"misfire monitor complete" },
-      // heavy-duty (no id -> keyword resolve; skipped if absent)
       dpfSoot:      { keyword:"particulate filter 1 soot", dir:"high", normal:60, critical:90 },
       defLevel:     { keyword:"diesel exhaust fluid", dir:"low", normal:20, critical:5 },
       noxIn:        { keyword:"nox", dir:"high" }, noxOut: { keyword:"outlet nox", dir:"high" },
@@ -234,6 +401,9 @@ geotab.addin.vehicleHealth = () => {
     return d;
   }
 
+  const DISP_RANK={ "Remove from service":5, "Service now":4, "Schedule diagnostic":3, "Watch \u2013 intermittent":2, "Monitor":1, "OK":0, "Unknown":-1 };
+  const dispRank=d=>DISP_RANK[d]!=null?DISP_RANK[d]:0;
+
   // ---- emissions (Section 2) ----
   function emissionsHealth(s){
     const detail=[], parts=[];
@@ -261,29 +431,63 @@ geotab.addin.vehicleHealth = () => {
     else if(score>=40)disp="Monitor";
     return { score, disp, detail };
   }
-  function co2Estimate(s){
+
+  // CO2: windowed per-engine-hour. delta fuel / delta hours over the status window;
+  // if the hours delta exceeds windowDays*24 it is in seconds -> /3600 (decision 2).
+  function co2Estimate(s,dFuel,dHoursRaw,windowDays){
     const f=CONFIG.fuel.factorKgPerL[CONFIG.fuel.defaultType]||2.31;
     if(s.fuelTotal==null)return null;
     const total=s.fuelTotal*f, idle=(s.fuelIdle!=null?s.fuelIdle:0)*f;
-    const hrs=s.engineHours!=null?s.engineHours:(s.engineHoursAdj!=null?s.engineHoursAdj:null);
-    return { totalKg:total, idleKg:idle, perHour: hrs&&hrs>0? total/hrs : null,
+    let perHour=null;
+    if(dFuel!=null&&dFuel>0&&dHoursRaw!=null&&dHoursRaw>0){
+      let dh=dHoursRaw; if(dh>windowDays*24)dh=dh/3600;
+      if(dh>=0.5)perHour=(dFuel*f)/dh;
+    }
+    return { totalKg:total, idleKg:idle, perHour, perHourDays:windowDays,
              idleWaste: s.fuelIdle!=null && s.fuelIdle>=CONFIG.fuel.idleWasteWarnL };
   }
 
-  // ========================= data + render =========================
-  let API=null,STATE=null,NAME_BY_ID={},COMPUTED=[],TAB="breakdown";
+  // ========================= UI maps =========================
+  const PILL={ "Remove from service":"r","Service now":"o","Schedule diagnostic":"a","Watch \u2013 intermittent":"c",
+    "Monitor":"t","OK":"g","No data":"x","Unknown":"x",
+    "Service emissions system":"r","Check SCR / aftertreatment":"o","Recheck after drive cycle":"a" };
+  const BRANK={ "Remove from service":5,"Service now":4,"Schedule diagnostic":3,"Watch \u2013 intermittent":2,"Monitor":1,"OK":0,"Unknown":-1,"No data":-2 };
+  const ERANK={ "Service emissions system":4,"Check SCR / aftertreatment":3,"Recheck after drive cycle":2,"Monitor":1,"OK":0,"Unknown":-1,"No data":-2 };
+  const SWATCH={ r:"#CF4520", o:"#E87722", a:"#E8A722", c:"#407EC9", t:"#00859B", g:"#84BD00", x:"#98A4AE" };
+  const KPI_BD=[
+    {id:"urgent",label:"Urgent",cls:"r",set:["Remove from service","Service now"]},
+    {id:"schedule",label:"Schedule",cls:"a",set:["Schedule diagnostic"]},
+    {id:"watch",label:"Watch & monitor",cls:"t",set:["Watch \u2013 intermittent","Monitor"]},
+    {id:"healthy",label:"Healthy",cls:"g",set:["OK"]},
+  ];
+  const KPI_EM=[
+    {id:"service",label:"Service",cls:"r",set:["Service emissions system","Check SCR / aftertreatment"]},
+    {id:"recheck",label:"Recheck",cls:"a",set:["Recheck after drive cycle"]},
+    {id:"monitor",label:"Monitor",cls:"t",set:["Monitor"]},
+    {id:"healthy",label:"Healthy",cls:"g",set:["OK"]},
+  ];
+
+  // ========================= state + dom helpers =========================
+  let API=null,STATE=null,NAME_BY_ID={},COMPUTED=[],LOADING=false;
+  let TAB="breakdown", FILTER=null, FILTER_ID="all", SEARCH="", SORTK="disp", SORTD=-1, PAGE=0;
   const el=id=>document.getElementById(id);
-  const setMsg=t=>{ const m=el("vhs-msg"); if(m)m.textContent=t||""; };
   const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  const setMsg=t=>{ const m=el("vh-status"); if(m)m.innerHTML=t||""; };
   const daysAgo=d=>new Date(Date.now()-d*864e5).toISOString();
   function normGroups(state){ const raw=(state.getGroupFilter&&state.getGroupFilter())||[]; return raw.map(g=>typeof g==="string"?{id:g}:g).filter(g=>g&&g.id); }
   const resolveId=kw=>{ const k=lc(kw); for(const id in NAME_BY_ID) if(lc(NAME_BY_ID[id]).indexOf(k)>-1)return id; return null; };
+  const dispOf=r=>TAB==="breakdown"?r.disp:r.em.disp;
+  const scoreOf=r=>TAB==="breakdown"?r.score:r.em.score;
+  const rankMap=()=>TAB==="breakdown"?BRANK:ERANK;
+  const fbClass=v=>v>=75?"r":v>=60?"o":v>=40?"a":"g";
 
+  // ========================= data pipeline =========================
   function run(){
-    const btn=el("vhs-refresh"); btn.disabled=true; setMsg("Loading vehicles, faults, events\u2026");
+    LOADING=true; const btn=el("vh-refresh"); if(btn)btn.disabled=true;
+    showLoading(); setMsg("Loading vehicles, faults and events\u2026");
     const groups=normGroups(STATE); const deviceSearch=groups.length?{groups}:{};
-    const fFrom=daysAgo(Number(el("vhs-window").value)||CONFIG.faultLookbackDays);
-
+    const winDays=Number(el("vh-window").value)||CONFIG.faultLookbackDays;
+    const fFrom=daysAgo(winDays);
     API.multiCall([
       ["Get",{typeName:"Device",search:deviceSearch,resultsLimit:CONFIG.maxDevices}],
       ["Get",{typeName:"FaultData",search:{fromDate:fFrom},resultsLimit:CONFIG.faultLimit}],
@@ -291,22 +495,17 @@ geotab.addin.vehicleHealth = () => {
       ["Get",{typeName:"DVIRLog",search:{fromDate:fFrom},resultsLimit:CONFIG.dvirLimit}],
       ["Get",{typeName:"Rule",resultsLimit:CONFIG.ruleLimit}],
     ],([devices,faults,exceptions,dvirs,rules])=>{
-      if(!devices||!devices.length){ btn.disabled=false; setMsg("No vehicles for the current group filter."); COMPUTED=[]; renderActive(); return; }
+      LOADING=false; if(btn)btn.disabled=false;
+      if(!devices||!devices.length){ COMPUTED=[]; setMsg("No vehicles for the current group filter."); renderAll(); return; }
       const idSet=new Set(devices.map(d=>d.id));
-
-      // harsh rule ids
       const harshRuleIds={}; (rules||[]).forEach(r=>{ if(CONFIG.harshRuleKeywords.some(k=>lc(r.name).indexOf(k)>-1))harshRuleIds[r.id]=1; });
       const harshByDev={}; (exceptions||[]).forEach(e=>{ const dv=e.device&&e.device.id, ru=e.rule&&e.rule.id;
         if(dv&&idSet.has(dv)&&ru&&harshRuleIds[ru])harshByDev[dv]=(harshByDev[dv]||0)+1; });
-
-      // open DVIR defects per device (best-effort across schema shapes)
       const defectsByDev={}; (dvirs||[]).forEach(l=>{ const dv=l.device&&l.device.id; if(!dv||!idSet.has(dv))return;
         const list=l.defects||l.dvirDefects||[]; let open=0;
         list.forEach(d=>{ const rs=lc((d&&(d.repairStatus||(d.defect&&d.defect.repairStatus)))||""); if(rs===""||rs.indexOf("notrepaired")>-1||rs.indexOf("repairrequired")>-1)open++; });
         if(l.isSafeToOperate===false&&!list.length)open=Math.max(open,1);
         defectsByDev[dv]=(defectsByDev[dv]||0)+open; });
-
-      // classify + bucket faults
       const perDev={}; devices.forEach(d=>perDev[d.id]={vehicle:[],battery:[],device:[]});
       const faultDiagIds=[],seen={};
       (faults||[]).forEach(f=>{ const dv=f.device&&f.device.id; if(!dv||!idSet.has(dv))return;
@@ -315,131 +514,322 @@ geotab.addin.vehicleHealth = () => {
       const proceed=()=>{
         (faults||[]).forEach(f=>{ const dv=f.device&&f.device.id; if(!dv||!idSet.has(dv))return;
           const name=NAME_BY_ID[(f.diagnostic&&f.diagnostic.id)]||""; perDev[dv][classify(f,name)].push(f); });
-
-        // resolve signal ids (configured id, else keyword) and fetch latest per device
         const sigKeys=Object.keys(CONFIG.signals);
         const sigId={}; sigKeys.forEach(k=>{ sigId[k]=CONFIG.signals[k].id||resolveId(CONFIG.signals[k].keyword); });
         const active=sigKeys.filter(k=>sigId[k]);
         const calls=[],idx=[],sFrom=daysAgo(CONFIG.statusLookbackDays);
         devices.forEach(dev=>active.forEach(k=>{ calls.push(["Get",{typeName:"StatusData",
-          search:{deviceSearch:{id:dev.id},diagnosticSearch:{id:sigId[k]},fromDate:sFrom},resultsLimit:50}]); idx.push({dev:dev.id,key:k}); }));
-
+          search:{deviceSearch:{id:dev.id},diagnosticSearch:{id:sigId[k]},fromDate:sFrom},resultsLimit:CONFIG.statusLimit}]); idx.push({dev:dev.id,key:k}); }));
+        const firstBy={};
         const finish=latestBy=>{
           COMPUTED=devices.map(dev=>{
-            const b=perDev[dev.id], s=latestBy[dev.id]||{};
+            const b=perDev[dev.id], s=latestBy[dev.id]||{}, f0=firstBy[dev.id]||{};
             const dtc=dtcTerm(groupByDiagnostic(b.vehicle,NAME_BY_ID));
             const battOcc=b.battery.length;
+            const harsh=harshByDev[dev.id]!=null?harshByDev[dev.id]:null;
+            const openDef=defectsByDev[dev.id]!=null?defectsByDev[dev.id]:null;
             const terms={ DTC:dtc.score, T:tempTerm(s), P:pressureTerm(s),
-              U:usageTerm(s,harshByDev[dev.id]!=null?harshByDev[dev.id]:null),
-              M:maintTerm(s,defectsByDev[dev.id]!=null?defectsByDev[dev.id]:null), B:batteryTerm(s,battOcc) };
-            const score=combine(terms);
-            const em=emissionsHealth(s); const co2=co2Estimate(s);
-            return { name:dev.name||dev.id, score, terms, disp:score==null?"Unknown":disposition(dtc.items,terms.B),
-              items:dtc.items, battOcc, deviceFaultCount:b.device.length,
-              harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, em, co2 };
+              U:usageTerm(s,harsh), M:maintTerm(s,openDef), B:batteryTerm(s,battOcc) };
+            const hasData = b.vehicle.length||b.battery.length||Object.keys(s).length||(harsh&&harsh>0)||(openDef&&openDef>0);
+            const dFuel=(s.fuelTotal!=null&&f0.fuelTotal!=null)?s.fuelTotal-f0.fuelTotal:null;
+            const hk=s.engineHours!=null?"engineHours":(s.engineHoursAdj!=null?"engineHoursAdj":null);
+            const dHours=(hk&&f0[hk]!=null)?s[hk]-f0[hk]:null;
+            let score,disp,em,co2;
+            if(!hasData){ score=null; disp="No data"; em={score:null,disp:"No data",detail:[]}; co2=null; }
+            else { score=combine(terms); disp=score==null?"Unknown":disposition(dtc.items,terms.B);
+                   em=emissionsHealth(s); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackDays); }
+            return { id:dev.id, name:dev.name||dev.id, score, terms, disp, items:dtc.items,
+              battOcc, deviceFaultCount:b.device.length, harsh:harshByDev[dev.id]||0,
+              openDefects:defectsByDev[dev.id]||0, em, co2, noData:!hasData };
           });
-          btn.disabled=false; renderActive();
-          setMsg(COMPUTED.length+" vehicle(s) \u00b7 fault window "+el("vhs-window").value+" days \u00b7 "+active.length+" signals resolved");
+          PAGE=0; renderAll();
+          setMsg("<b>"+COMPUTED.length+"</b> vehicles \u00b7 "+winDays+"-day window \u00b7 <b>"+active.length+"</b> signals resolved");
         };
-
         if(!calls.length){ finish({}); return; }
-        setMsg("Loading "+calls.length+" signal readings\u2026");
+        setMsg("Reading "+calls.length+" signal series\u2026");
         API.multiCall(calls,results=>{ const by={};
           results.forEach((rows,i)=>{ const {dev,key}=idx[i]; if(!rows||!rows.length)return;
-            const newest=rows.reduce((a,b)=>new Date(a.dateTime)>new Date(b.dateTime)?a:b);
-            (by[dev]=by[dev]||{})[key]=newest.data; });
+            let nw=rows[0], od=rows[0];
+            for(const r of rows){ const t=new Date(r.dateTime); if(t>new Date(nw.dateTime))nw=r; if(t<new Date(od.dateTime))od=r; }
+            (by[dev]=by[dev]||{})[key]=nw.data; (firstBy[dev]=firstBy[dev]||{})[key]=od.data; });
           finish(by);
         },fail);
       };
-
       NAME_BY_ID={};
       if(faultDiagIds.length){ API.call("Get",{typeName:"Diagnostic",search:{ids:faultDiagIds}},diags=>{ (diags||[]).forEach(d=>{NAME_BY_ID[d.id]=d.name;}); proceed(); },fail); }
       else proceed();
     },fail);
   }
+  function fail(err){ LOADING=false; const b=el("vh-refresh"); if(b)b.disabled=false;
+    setMsg("Error: "+(err&&err.message?err.message:String(err))); showError(); console.error("[VehicleHealth]",err); }
 
-  // ---- rendering ----
-  const tcell=v=> v==null?'<td class="vhs-term vhs-na vhs-num">\u2014</td>':'<td class="vhs-term vhs-num">'+Math.round(v)+'</td>';
+  // ========================= rendering =========================
+  const pillHTML=d=>'<span class="vh-pill pill-'+(PILL[d]||"x")+'">'+esc(d)+'</span>';
+  function scoreCell(v){
+    if(v==null)return '<div class="vh-sc na"><span class="n">\u2014</span></div>';
+    return '<div class="vh-sc"><span class="n num">'+Math.round(v)+'</span>'
+      +'<span class="track"><i class="fb-'+fbClass(v)+'" style="width:'+Math.max(3,Math.round(v))+'%"></i></span></div>';
+  }
+  const TERMS=[["DTC","D"],["T","T"],["P","P"],["U","U"],["M","M"],["B","B"]];
+  function miniBars(terms){
+    return '<div class="vh-bars">'+TERMS.map(t=>{ const k=t[0],ch=t[1]; const v=terms?terms[k]:null;
+      if(v==null)return '<span class="vh-fb na" title="'+k+': no data"><span class="tk"></span><b>'+ch+'</b></span>';
+      return '<span class="vh-fb" title="'+k+': '+Math.round(v)+'"><span class="tk"><i class="fl fb-'+fbClass(v)+'" style="height:'+Math.max(6,Math.round(v))+'%"></i></span><b>'+ch+'</b></span>';
+    }).join("")+'</div>';
+  }
+  function counts(){ const c={}; COMPUTED.forEach(r=>{ const d=dispOf(r); c[d]=(c[d]||0)+1; }); return c; }
 
-  function breakdownDetail(r){
-    const rows=r.items.length?r.items.map(i=>'<tr><td>'+esc(i.name)+(i.safety?' \u26a0 safety':'')+'</td><td>'+i.domState+(i.intermittent?' (intermittent)':'')
-      +'</td><td>'+(i.worstSeverity!=null?Math.round(i.worstSeverity):"\u2014")+'</td><td>'+(i.maxRisk!=null?i.maxRisk.toFixed(1)+"%":"\u2014")
-      +'</td><td>'+i.occurrences+'</td><td>'+Math.round(i.contribution)+'</td></tr>').join("")
-      :'<tr><td colspan="6" class="vhs-term">No vehicle ECU faults.</td></tr>';
-    let x="";
-    if(r.battOcc)x+='<div class="vhs-term" style="margin-top:6px;">Electrical: '+r.battOcc+' battery/low-voltage record(s) \u2192 B term.</div>';
-    if(r.harsh)x+='<div class="vhs-term">Harsh-driving events in window: '+r.harsh+' \u2192 U term.</div>';
-    if(r.openDefects)x+='<div class="vhs-term">Open DVIR defect(s): '+r.openDefects+' \u2192 M term.</div>';
-    if(r.deviceFaultCount)x+='<div class="vhs-term">Device/data-quality: '+r.deviceFaultCount+' GO-device record(s) (excluded from score).</div>';
-    return '<table><thead><tr><th>Vehicle fault</th><th>State</th><th>Severity</th><th>Risk</th><th>Count</th><th>Score</th></tr></thead><tbody>'+rows+'</tbody></table>'+x;
+  function renderSummary(){
+    const wrap=el("vh-summary"); if(!wrap)return;
+    const total=COMPUTED.length||1, c=counts();
+    const kpis=TAB==="breakdown"?KPI_BD:KPI_EM;
+    const cards=kpis.map((k,i)=>{ const n=k.set.reduce((a,d)=>a+(c[d]||0),0); const pct=Math.round(n/total*100);
+      const mine=k.set.slice().sort().join("|"); const selSet=FILTER?Array.from(FILTER).sort().join("|"):"";
+      const sel=FILTER_ID===("kpi:"+k.id)||(FILTER&&selSet===mine);
+      return '<button class="vh-kpi'+(sel?" sel":"")+'" data-kpi="'+k.id+'" style="--kc:'+SWATCH[k.cls]+';animation-delay:'+(i*55)+'ms">'
+        +'<span class="kdot"></span><div class="kl">'+k.label+'</div><div class="kn num">'+n+'</div>'
+        +'<div class="kp"><b>'+pct+'%</b> of fleet</div></button>'; }).join("");
+    const RANK=rankMap();
+    const present=Object.keys(c).sort((a,b)=>(RANK[b]!=null?RANK[b]:0)-(RANK[a]!=null?RANK[a]:0));
+    const segs=present.map(d=>'<i title="'+esc(d)+': '+c[d]+'" data-seg="'+esc(d)+'" style="width:'+(c[d]/total*100)+'%;background:'+SWATCH[PILL[d]||"x"]+'"></i>').join("");
+    const legend=present.map(d=>'<button class="vh-leg" data-seg="'+esc(d)+'"><span class="sw" style="background:'+SWATCH[PILL[d]||"x"]+'"></span>'+esc(d)+' <b>'+c[d]+'</b></button>').join("");
+    let co2line="";
+    if(TAB==="emissions"){ let kg=0,any=false; COMPUTED.forEach(r=>{ if(r.co2){kg+=r.co2.totalKg;any=true;} });
+      co2line=any?'<div class="co2">Fleet CO\u2082 (est) <b>'+(kg>=1000?(kg/1000).toFixed(1)+" t":Math.round(kg)+" kg")+'</b> \u00b7 fuel-derived</div>':""; }
+    wrap.innerHTML='<div class="vh-kpis">'+cards+'</div>'
+      +'<div class="vh-dist"><div class="vh-dist-top"><span class="t">Fleet distribution</span>'+co2line+'</div>'
+      +'<div class="vh-bar">'+segs+'</div><div class="vh-legend">'+legend+'</div></div>';
+    wrap.querySelectorAll("[data-kpi]").forEach(b=>b.addEventListener("click",()=>{
+      const k=kpis.find(x=>x.id===b.getAttribute("data-kpi"));
+      if(FILTER_ID==="kpi:"+k.id){ setFilter("all",null); } else { setFilter("kpi:"+k.id,new Set(k.set)); } }));
+    wrap.querySelectorAll("[data-seg]").forEach(b=>b.addEventListener("click",()=>{
+      const d=b.getAttribute("data-seg");
+      if(FILTER_ID==="seg:"+d){ setFilter("all",null); } else { setFilter("seg:"+d,new Set([d])); } }));
   }
-  function emissionsDetail(r){
-    const lines=r.em.detail.length?r.em.detail.map(d=>'<div class="vhs-term">\u2022 '+esc(d)+'</div>').join(""):'<div class="vhs-term">No emissions issues detected from available signals.</div>';
-    let c="";
-    if(r.co2)c='<div class="vhs-term" style="margin-top:6px;">Est. CO\u2082 (fuel-derived): '+Math.round(r.co2.totalKg)+' kg total \u00b7 '+Math.round(r.co2.idleKg)+' kg from idling'
-      +(r.co2.perHour!=null?' \u00b7 '+r.co2.perHour.toFixed(2)+' kg/engine-hr':'')+(r.co2.idleWaste?' \u26a0 high idle waste':'')+'. Estimate only \u2014 use Geotab Sustainability Center for certified figures.</div>';
-    return lines+c;
+  function renderFilters(){
+    const f=el("vh-filters"); if(!f)return; const total=COMPUTED.length, c=counts();
+    const RANK=rankMap();
+    const present=Object.keys(c).sort((a,b)=>(RANK[b]!=null?RANK[b]:0)-(RANK[a]!=null?RANK[a]:0));
+    let html='<button class="vh-fpill'+(FILTER_ID==="all"?" on":"")+'" data-f="all">All<span class="c num">'+total+'</span></button>';
+    html+=present.map(d=>'<button class="vh-fpill'+(FILTER_ID==="seg:"+d?" on":"")+'" data-f="'+esc(d)+'">'+esc(d)+'<span class="c num">'+c[d]+'</span></button>').join("");
+    f.innerHTML=html;
+    f.querySelectorAll("[data-f]").forEach(b=>b.addEventListener("click",()=>{
+      const v=b.getAttribute("data-f");
+      if(v==="all")setFilter("all",null); else if(FILTER_ID==="seg:"+v)setFilter("all",null); else setFilter("seg:"+v,new Set([v])); }));
   }
-  function renderTable(getCols,getDetail){
-    const body=COMPUTED.map((r,i)=>'<tr class="vhs-row" data-i="'+i+'"><td><span class="vhs-caret">\u25b8</span>'+esc(r.name)
-      +(r.deviceFaultCount?'<span class="vhs-flag">device \u26a0</span>':'')+'</td>'+getCols(r)+'</tr>'
-      +'<tr class="vhs-detail" data-detail="'+i+'" style="display:none;"><td colspan="20">'+getDetail(r)+'</td></tr>').join("");
-    return body;
+  function filtered(){
+    let arr=COMPUTED.slice();
+    if(SEARCH){ const q=SEARCH.toLowerCase(); arr=arr.filter(r=>r.name.toLowerCase().indexOf(q)>-1); }
+    if(FILTER){ arr=arr.filter(r=>FILTER.has(dispOf(r))); }
+    const RANK=rankMap();
+    const byName=(a,b)=>{ const x=a.name.toLowerCase(),y=b.name.toLowerCase(); return x<y?-1:x>y?1:0; };
+    const byRank=(a,b)=>(RANK[dispOf(a)]!=null?RANK[dispOf(a)]:0)-(RANK[dispOf(b)]!=null?RANK[dispOf(b)]:0);
+    const byScore=(a,b)=>{ const sa=scoreOf(a),sb=scoreOf(b); return (sa==null?-1:sa)-(sb==null?-1:sb); };
+    const byCO2=(a,b)=>{ const sa=a.co2?a.co2.totalKg:-1, sb=b.co2?b.co2.totalKg:-1; return sa-sb; };
+    arr.sort((a,b)=>{ let c=SORTK==="name"?byName(a,b):SORTK==="score"?byScore(a,b):SORTK==="co2"?byCO2(a,b):byRank(a,b);
+      if(c===0)c=byRank(a,b); if(c===0)c=byScore(a,b); return SORTD*c; });
+    return arr;
   }
-  function renderActive(){
-    const out=el("vhs-out"); if(!out)return;
-    if(!COMPUTED.length){ out.innerHTML='<p class="vhs-msg">No data.</p>'; return; }
-    let head,body;
+  function thCell(key,label){ const act=SORTK===key; const ar=act?(SORTD<0?"\u25bc":"\u25b2"):"\u25bc";
+    return '<th class="srt'+(act?" act":"")+'" data-srt="'+key+'">'+label+'<span class="ar">'+ar+'</span></th>'; }
+  function renderTable(){
+    const wrap=el("vh-tablewrap"), pager=el("vh-pager"); if(!wrap)return;
+    if(LOADING){ showLoading(); return; }
+    if(!COMPUTED.length){ wrap.innerHTML='<div class="vh-state"><div class="ico">\u25CE</div><div class="t">No vehicles to show</div><div class="d">Adjust the group filter in MyGeotab, then Refresh.</div></div>'; if(pager)pager.innerHTML=""; return; }
+    const rows=filtered();
+    if(!rows.length){ wrap.innerHTML='<div class="vh-state"><div class="ico">\u2315</div><div class="t">No matches</div><div class="d">No vehicles match this filter or search.</div></div>'; if(pager)pager.innerHTML=""; return; }
+    const ps=CONFIG.pageSize, pages=Math.ceil(rows.length/ps);
+    if(PAGE>=pages)PAGE=pages-1; if(PAGE<0)PAGE=0;
+    const slice=rows.slice(PAGE*ps,PAGE*ps+ps);
+    let head;
     if(TAB==="breakdown"){
-      COMPUTED.sort((a,b)=>(b.score==null?-1:b.score)-(a.score==null?-1:a.score));
-      head='<th>Vehicle</th><th>Score</th><th>Status</th><th>Disposition</th><th>DTC</th><th>T</th><th>P</th><th>U</th><th>M</th><th>B</th>';
-      body=renderTable(r=>{ const bd=band(r.score); return '<td class="vhs-num"><span class="vhs-score">'+(r.score==null?"\u2014":Math.round(r.score))+'</span></td>'
-        +'<td><span class="vhs-band '+bd[1]+'">'+bd[0]+'</span></td><td class="vhs-disp">'+r.disp+'</td>'
-        +tcell(r.terms.DTC)+tcell(r.terms.T)+tcell(r.terms.P)+tcell(r.terms.U)+tcell(r.terms.M)+tcell(r.terms.B); }, breakdownDetail);
+      head='<tr>'+thCell("name","Vehicle")+thCell("score","Score")+thCell("disp","Disposition")+'<th>Risk factors</th><th></th></tr>';
     } else {
-      COMPUTED.sort((a,b)=>(b.em.score==null?-1:b.em.score)-(a.em.score==null?-1:a.em.score));
-      head='<th>Vehicle</th><th>Emissions health</th><th>Status</th><th>Disposition</th><th>Est. CO\u2082 (kg)</th>';
-      body=renderTable(r=>{ const bd=band(r.em.score); return '<td class="vhs-num"><span class="vhs-score">'+(r.em.score==null?"\u2014":Math.round(r.em.score))+'</span></td>'
-        +'<td><span class="vhs-band '+bd[1]+'">'+bd[0]+'</span></td><td class="vhs-disp">'+r.em.disp+'</td>'
-        +'<td class="vhs-num">'+(r.co2?Math.round(r.co2.totalKg):"\u2014")+'</td>'; }, emissionsDetail);
+      head='<tr>'+thCell("name","Vehicle")+thCell("score","Emissions")+thCell("disp","Disposition")+thCell("co2","CO\u2082 (kg)")+'<th>CO\u2082/hr</th><th></th></tr>';
     }
-    out.innerHTML='<table class="vhs-table"><thead><tr>'+head+'</tr></thead><tbody>'+body+'</tbody></table>'
-      +'<div class="vhs-note">Click any row for detail. Scores are calibration starting points \u2014 tune thresholds in CONFIG. CO\u2082 is a fuel-derived estimate, not certified.</div>';
-    out.querySelectorAll(".vhs-row").forEach(row=>row.addEventListener("click",()=>{ const d=out.querySelector('[data-detail="'+row.getAttribute("data-i")+'"]'); if(d)d.style.display=d.style.display==="none"?"":"none"; }));
+    const body=slice.map(r=>{
+      const flag=r.deviceFaultCount?'<span class="vh-tag vh-tag-dev" title="Telematics device fault recorded \u2014 excluded from score">device</span>':"";
+      const veh='<td class="vh-veh"><span class="vh-vehname">'+esc(r.name)+'</span>'+flag+'</td>';
+      if(TAB==="breakdown"){
+        return '<tr class="vh-tr'+(r.noData?" nodata":"")+'" data-id="'+esc(r.id)+'">'+veh
+          +'<td>'+scoreCell(r.score)+'</td><td>'+pillHTML(r.disp)+'</td>'
+          +'<td>'+miniBars(r.terms)+'</td><td class="vh-chev">\u203A</td></tr>';
+      }
+      const ph=r.co2&&r.co2.perHour!=null?('~'+r.co2.perHour.toFixed(1)):"\u2014";
+      const tot=r.co2?Math.round(r.co2.totalKg):"\u2014";
+      return '<tr class="vh-tr'+(r.noData?" nodata":"")+'" data-id="'+esc(r.id)+'">'+veh
+        +'<td>'+scoreCell(r.em.score)+'</td><td>'+pillHTML(r.em.disp)+'</td>'
+        +'<td class="num">'+tot+'</td><td class="num vh-muted">'+ph+'</td><td class="vh-chev">\u203A</td></tr>';
+    }).join("");
+    wrap.innerHTML='<table class="vh-table"><thead>'+head+'</thead><tbody>'+body+'</tbody></table>';
+    wrap.querySelectorAll("[data-srt]").forEach(th=>th.addEventListener("click",()=>setSort(th.getAttribute("data-srt"))));
+    wrap.querySelectorAll(".vh-tr").forEach(tr=>tr.addEventListener("click",()=>openDrawer(tr.getAttribute("data-id"))));
+    if(pager){ const from=PAGE*ps+1, to=Math.min(rows.length,PAGE*ps+ps);
+      pager.innerHTML='<span class="pinfo">Showing <b>'+from+'\u2013'+to+'</b> of <b>'+rows.length+'</b></span>'
+        +'<button class="vh-pg" id="vh-prev"'+(PAGE<=0?" disabled":"")+'>\u2190 Prev</button>'
+        +'<span class="vh-pg-n num">Page '+(PAGE+1)+' / '+pages+'</span>'
+        +'<button class="vh-pg" id="vh-next"'+(PAGE>=pages-1?" disabled":"")+'>Next \u2192</button>';
+      const p=el("vh-prev"),n=el("vh-next");
+      if(p)p.addEventListener("click",()=>{ PAGE--; renderTable(); });
+      if(n)n.addEventListener("click",()=>{ PAGE++; renderTable(); }); }
   }
-  function setTab(t){ TAB=t; el("vhs-tab-bd").classList.toggle("vhs-on",t==="breakdown"); el("vhs-tab-em").classList.toggle("vhs-on",t==="emissions"); renderActive(); }
-  function fail(err){ const b=el("vhs-refresh"); if(b)b.disabled=false; setMsg("Error: "+(err&&err.message?err.message:String(err))); console.error("[VehicleHealth]",err); }
+  function renderAll(){
+    const ttl=el("vh-panel-title"); if(ttl)ttl.textContent=TAB==="breakdown"?"Vehicle detail":"Emissions detail";
+    const cnt=el("vh-count"); if(cnt)cnt.textContent=COMPUTED.length?("\u00b7 "+COMPUTED.length+" total"):"";
+    renderSummary(); renderFilters(); renderTable();
+  }
+  function showLoading(){ const w=el("vh-tablewrap"); if(w)w.innerHTML='<div class="vh-state"><div class="vh-spin"></div><div class="t">Loading fleet data\u2026</div><div class="d">Fetching faults, signals and events from Geotab.</div></div>'; const p=el("vh-pager"); if(p)p.innerHTML=""; const s=el("vh-summary"); if(s)s.innerHTML=""; }
+  function showError(){ const w=el("vh-tablewrap"); if(w)w.innerHTML='<div class="vh-state"><div class="ico">\u26A0</div><div class="t">Could not load data</div><div class="d">See the status line above, then try Refresh.</div></div>'; }
+
+  // ---- drawer ----
+  function termRow(label,key,terms){ const v=terms?terms[key]:null;
+    if(v==null)return '<div class="vh-trm na"><span class="lab">'+label+'</span><span class="tk"></span><span class="v">\u2014</span></div>';
+    return '<div class="vh-trm"><span class="lab">'+label+'</span><span class="tk"><i class="fb-'+fbClass(v)+'" style="width:'+Math.max(3,Math.round(v))+'%"></i></span><span class="v">'+Math.round(v)+'</span></div>'; }
+  function breakdownDrawer(r){
+    const w=CONFIG.weights;
+    const terms='<div class="vh-sec"><div class="h">Risk factors (weight)</div><div class="vh-terms">'
+      +termRow("DTC \u00b7 "+(w.DTC*100)+"%","DTC",r.terms)+termRow("Temp \u00b7 "+(w.T*100)+"%","T",r.terms)
+      +termRow("Pressure \u00b7 "+(w.P*100)+"%","P",r.terms)+termRow("Usage \u00b7 "+(w.U*100)+"%","U",r.terms)
+      +termRow("Maint \u00b7 "+(w.M*100)+"%","M",r.terms)+termRow("Battery \u00b7 "+(w.B*100)+"%","B",r.terms)+'</div></div>';
+    const frows=r.items.length?r.items.map(i=>'<tr><td>'+esc(i.name)+(i.safety?' \u26a0':'')+'</td><td>'+i.domState+(i.intermittent?' \u00b7 intermittent':'')
+      +'</td><td class="num">'+(i.worstSeverity!=null?Math.round(i.worstSeverity):"\u2014")+'</td><td class="num">'+(i.maxRisk!=null?i.maxRisk.toFixed(1)+"%":"\u2014")
+      +'</td><td class="num">'+i.occurrences+'</td><td class="num">'+Math.round(i.contribution)+'</td></tr>').join("")
+      :'<tr><td colspan="6" class="vh-muted">No vehicle ECU faults in window.</td></tr>';
+    const faults='<div class="vh-sec"><div class="h">Diagnostic faults</div><table class="vh-dtable"><thead><tr><th>Fault</th><th>State</th><th>Sev</th><th>Risk</th><th>Count</th><th>Score</th></tr></thead><tbody>'+frows+'</tbody></table></div>';
+    const notes=[];
+    if(r.battOcc)notes.push("Electrical: "+r.battOcc+" battery / low-voltage record(s) \u2192 Battery term.");
+    if(r.harsh)notes.push("Harsh-driving events in window: "+r.harsh+" \u2192 Usage term.");
+    if(r.openDefects)notes.push("Open DVIR defect(s): "+r.openDefects+" \u2192 Maintenance term.");
+    if(r.deviceFaultCount)notes.push("Telematics device records: "+r.deviceFaultCount+" (excluded from score).");
+    const ns=notes.length?'<div class="vh-sec"><div class="h">Notes</div>'+notes.map(n=>'<div class="vh-li">'+esc(n)+'</div>').join("")+'</div>':"";
+    return terms+faults+ns;
+  }
+  function emissionsDrawer(r){
+    const lines=r.em.detail.length?r.em.detail.map(d=>'<div class="vh-li">'+esc(d)+'</div>').join(""):'<div class="vh-li vh-muted">No emissions issues detected from available signals.</div>';
+    let co2="";
+    if(r.co2){ const ph=r.co2.perHour!=null?('<br><b>~'+r.co2.perHour.toFixed(1)+' kg CO\u2082 / engine-hour</b> (last '+r.co2.perHourDays+' days)'):"";
+      co2='<div class="vh-sec"><div class="h">Carbon estimate</div><div class="vh-callout">'
+        +'<b>'+Math.round(r.co2.totalKg)+' kg</b> total \u00b7 <b>'+Math.round(r.co2.idleKg)+' kg</b> from idling'
+        +(r.co2.idleWaste?' \u26a0 high idle waste':'')+ph
+        +'<br><span class="vh-muted">Fuel-derived estimate. Use the Geotab Sustainability Center for certified figures.</span></div></div>'; }
+    return '<div class="vh-sec"><div class="h">Findings</div>'+lines+'</div>'+co2;
+  }
+  function openDrawer(id){
+    const r=COMPUTED.find(x=>x.id===id); if(!r)return;
+    const sc=TAB==="breakdown"?r.score:r.em.score, disp=TAB==="breakdown"?r.disp:r.em.disp;
+    const col=SWATCH[fbClass(sc==null?0:sc)];
+    const body=TAB==="breakdown"?breakdownDrawer(r):emissionsDrawer(r);
+    el("vh-drawer").innerHTML='<div class="vh-drawer-head"><div class="row1"><div>'
+      +'<h3>'+esc(r.name)+'</h3><div class="sub">'+(TAB==="breakdown"?"Breakdown risk":"Emissions health")
+      +(r.deviceFaultCount?' \u00b7 device fault present':'')+'</div></div>'
+      +'<button class="vh-x" id="vh-dx" aria-label="Close">\u2715</button></div>'
+      +'<div class="meta"><span class="vh-bigscore" style="color:'+(sc==null?"#9aa3c4":col)+'">'+(sc==null?"\u2014":Math.round(sc))+'</span>'+pillHTML(disp)+'</div></div>'
+      +'<div class="vh-drawer-body">'+body+'</div>';
+    el("vh-dx").addEventListener("click",closeDrawer);
+    el("vh-drawer").classList.add("on"); el("vh-scrim").classList.add("on");
+  }
+  function closeDrawer(){ el("vh-drawer").classList.remove("on"); el("vh-scrim").classList.remove("on"); }
+
+  // ---- controls ----
+  function setTab(t){ if(TAB===t)return; TAB=t; FILTER=null; FILTER_ID="all"; PAGE=0; SORTK="disp"; SORTD=-1;
+    el("vh-tab-bd").classList.toggle("on",t==="breakdown"); el("vh-tab-em").classList.toggle("on",t==="emissions"); renderAll(); }
+  function setFilter(id,set){ FILTER_ID=id; FILTER=set; PAGE=0; renderSummary(); renderFilters(); renderTable(); }
+  function setSort(k){ if(SORTK===k){ SORTD=-SORTD; } else { SORTK=k; SORTD=(k==="name")?1:-1; } PAGE=0; renderTable(); }
+  function exportCSV(){
+    const rows=filtered(); if(!rows.length)return;
+    const q=s=>'"'+String(s==null?"":s).replace(/"/g,'""')+'"';
+    let head,line;
+    if(TAB==="breakdown"){ head=["Vehicle","Score","Disposition","DTC","Temp","Pressure","Usage","Maintenance","Battery","Device faults"];
+      line=r=>[r.name,r.score==null?"":Math.round(r.score),r.disp,
+        r.terms.DTC==null?"":Math.round(r.terms.DTC),r.terms.T==null?"":Math.round(r.terms.T),r.terms.P==null?"":Math.round(r.terms.P),
+        r.terms.U==null?"":Math.round(r.terms.U),r.terms.M==null?"":Math.round(r.terms.M),r.terms.B==null?"":Math.round(r.terms.B),r.deviceFaultCount]; }
+    else { head=["Vehicle","Emissions score","Disposition","CO2 total kg","CO2 idle kg","CO2 per engine-hour","Findings"];
+      line=r=>[r.name,r.em.score==null?"":Math.round(r.em.score),r.em.disp,
+        r.co2?Math.round(r.co2.totalKg):"",r.co2?Math.round(r.co2.idleKg):"",r.co2&&r.co2.perHour!=null?r.co2.perHour.toFixed(2):"",
+        (r.em.detail||[]).join("; ")]; }
+    const csv=[head.map(q).join(",")].concat(rows.map(r=>line(r).map(q).join(","))).join("\r\n");
+    const blob=new Blob(["\ufeff"+csv],{type:"text/csv;charset=utf-8;"});
+    const url=URL.createObjectURL(blob); const a=document.createElement("a");
+    a.href=url; a.download="vehicle-health-"+TAB+".csv"; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1500);
+  }
 
   // ========================= lifecycle =========================
   return {
     initialize(api,state,callback){ API=api; STATE=state;
-      el("vhs-window").value=String(CONFIG.faultLookbackDays);
-      el("vhs-refresh").addEventListener("click",run);
-      el("vhs-tab-bd").addEventListener("click",()=>setTab("breakdown"));
-      el("vhs-tab-em").addEventListener("click",()=>setTab("emissions"));
+      el("vh-window").value=String(CONFIG.faultLookbackDays);
+      el("vh-refresh").addEventListener("click",run);
+      el("vh-window").addEventListener("change",run);
+      el("vh-tab-bd").addEventListener("click",()=>setTab("breakdown"));
+      el("vh-tab-em").addEventListener("click",()=>setTab("emissions"));
+      el("vh-export").addEventListener("click",exportCSV);
+      el("vh-scrim").addEventListener("click",closeDrawer);
+      document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeDrawer(); });
+      const si=el("vh-search"); let t=null;
+      si.addEventListener("input",()=>{ SEARCH=si.value.trim(); PAGE=0; clearTimeout(t); t=setTimeout(renderTable,120); });
       callback();
     },
     focus(api,state){ API=api; STATE=state; run(); },
-    blur(){ const o=el("vhs-out"); if(o)o.innerHTML=""; }
+    blur(){ closeDrawer(); }
   };
 };
 </script>
 </head>
 <body>
-  <div id="vhs-root">
-    <h1>Vehicle Health</h1>
-    <p class="vhs-sub">Operational health for the current group filter. Higher score = higher concern. Click a row for detail.</p>
-    <div class="vhs-tabs">
-      <button id="vhs-tab-bd" class="vhs-tab vhs-on" type="button">Breakdown Risk</button>
-      <button id="vhs-tab-em" class="vhs-tab" type="button">Emissions Health</button>
-    </div>
-    <div class="vhs-controls">
-      <label for="vhs-window">Window</label>
-      <select id="vhs-window"><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option><option value="90">90 days</option></select>
-      <button id="vhs-refresh" type="button">Refresh</button>
-    </div>
-    <p id="vhs-msg" class="vhs-msg"></p>
-    <div id="vhs-out"></div>
+  <div id="vh-app">
+    <header class="vh-header">
+      <!-- Brand: official logo NOT recreated per Lytx guidelines. To use the official asset,
+           replace the .vh-brand contents with:
+           <img src="lytx-with-geotab-white.svg" alt="Lytx+ with Geotab" style="height:26px"> -->
+      <div class="vh-brand" aria-label="Lytx Plus with Geotab">
+        <span class="vh-brand-mark">Lytx<span class="vh-plus">+</span></span>
+        <span class="vh-brand-sep"></span>
+        <span class="vh-brand-sub">with Geotab</span>
+      </div>
+      <div class="vh-head-titles">
+        <h1>Vehicle health</h1>
+        <p>Operational health for your active fleet</p>
+      </div>
+      <div class="vh-head-controls">
+        <div class="vh-seg" role="tablist" aria-label="Section">
+          <button id="vh-tab-bd" class="on" type="button">Breakdown risk</button>
+          <button id="vh-tab-em" type="button">Emissions health</button>
+        </div>
+        <label class="vh-field">Window
+          <select id="vh-window">
+            <option value="7">7 days</option><option value="14">14 days</option>
+            <option value="30">30 days</option><option value="90">90 days</option>
+          </select>
+        </label>
+        <button id="vh-refresh" class="vh-btn" type="button">Refresh</button>
+      </div>
+    </header>
+    <main class="vh-main">
+      <p id="vh-status" class="vh-status"></p>
+      <section id="vh-summary" class="vh-summary"></section>
+      <section class="vh-panel">
+        <div class="vh-panel-head">
+          <div><h2 id="vh-panel-title" style="display:inline">Vehicle detail</h2><span id="vh-count" class="vh-count"></span></div>
+          <div class="vh-tools">
+            <div id="vh-filters" class="vh-filters"></div>
+            <div class="vh-search">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#cdd4e6" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input id="vh-search" type="text" placeholder="Search vehicle&hellip;" aria-label="Search vehicle" />
+            </div>
+            <button id="vh-export" class="vh-btn vh-btn-ghost" type="button">Export CSV</button>
+          </div>
+        </div>
+        <div id="vh-tablewrap" class="vh-tablewrap"></div>
+        <div id="vh-pager" class="vh-pager"></div>
+      </section>
+    </main>
+    <footer class="vh-footer">
+      <div class="tag">Protecting a world in motion</div>
+      <div class="note">Scores are operational triage signals, not certified diagnostics &mdash; tune thresholds in CONFIG. CO&#8322; figures are fuel-derived estimates; use the Geotab Sustainability Center for certified reporting.</div>
+      <div class="note">&ldquo;Lytx+&rdquo; and the Lytx+ logo are trademarks of Lytx, Inc. &ldquo;Geotab&rdquo; and the Geotab logo are registered trademarks of Geotab, Inc. in the United States and other countries.</div>
+    </footer>
   </div>
+  <div id="vh-scrim" class="vh-scrim"></div>
+  <aside id="vh-drawer" class="vh-drawer" role="dialog" aria-label="Vehicle detail"></aside>
 </body>
 </html>
