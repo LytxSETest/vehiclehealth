@@ -47,8 +47,6 @@ geotab.addin.vehicleHealth = () => {
       predictedRisk:{ id:"DiagnosticPredictedRiskOfBreakdownId", keyword:"predicted breakdown risk" }, // Geotab's own model (info only, not scored)
     },
     // ---- usage / harsh normalisation ----
-    harshPer100mi: { normal:3, critical:20 }, // harsh events per 100 mi - PLACEHOLDER; used when trip distance is known
-    harshMinMiles: 50,                        // need at least this many miles in window before trusting the per-mile rate
     staleHours: 48,                           // a device not reporting for longer than this counts as "Offline"
     // ---- scale + UI ----
     tripLimit: 50000,
@@ -88,11 +86,19 @@ geotab.addin.vehicleHealth = () => {
     return "vehicle";
   }
   function isSafetyFault(name){ return CONFIG.safetySystemKeywords.some(k=>lc(name).indexOf(k)>-1); }
+  // Geotab names unrecognized SPN/FMI codes like "**Unknown Diagnostic 521940" - make that readable.
+  function cleanDiagName(nm,id){
+    let s=String(nm==null?"":nm).replace(/\*/g,"").trim();
+    const m=s.match(/unknown diagnostic\s*([0-9]+)/i);
+    if(m) return "Unrecognized engine fault \u00b7 code "+m[1];
+    if(s) return s;
+    return "Unrecognized engine fault";
+  }
 
   function groupByDiagnostic(records,nameById){
     const by={};
     records.forEach(f=>{ const id=f.diagnostic&&f.diagnostic.id; if(!id)return;
-      const g=by[id]||(by[id]={id,name:nameById[id]||id,occurrences:0,states:{},worstSeverity:null,worstLamp:0,maxRisk:null,safety:false,first:f.dateTime,last:f.dateTime});
+      const g=by[id]||(by[id]={id,name:cleanDiagName(nameById[id],id),occurrences:0,states:{},worstSeverity:null,worstLamp:0,maxRisk:null,safety:false,first:f.dateTime,last:f.dateTime});
       g.occurrences++; const st=stateOf(f); g.states[st]=(g.states[st]||0)+1;
       const sv=severityToScore(f.severity||f.diagnosticSeverity); if(sv!=null)g.worstSeverity=Math.max(g.worstSeverity||0,sv);
       g.worstLamp=Math.max(g.worstLamp,lampToScore(f));
@@ -132,11 +138,8 @@ geotab.addin.vehicleHealth = () => {
     else if(s.fuelTotal!=null && s.fuelIdle!=null && s.fuelTotal>0) idleRatio=s.fuelIdle/s.fuelTotal;
     if(idleRatio!=null){ const c=CONFIG.idleRatio;
       parts.push(idleRatio<=c.normal?0:idleRatio>=c.critical?100:clamp((idleRatio-c.normal)/(c.critical-c.normal)*100,0,100)); }
-    // harsh: prefer per-distance rate when enough miles are known; else raw count over the window
-    if(harshCount!=null && ctx.distanceMi!=null && ctx.distanceMi>=CONFIG.harshMinMiles){
-      const per100=harshCount/ctx.distanceMi*100, h=CONFIG.harshPer100mi;
-      parts.push(per100<=h.normal?0:per100>=h.critical?100:clamp((per100-h.normal)/(h.critical-h.normal)*100,0,100));
-    } else if(harshCount!=null){ const h=CONFIG.harshRate;
+    // harsh: raw event count over the window (Trip still supplies the idle-time ratio above and mileage for display)
+    if(harshCount!=null){ const h=CONFIG.harshRate;
       parts.push(harshCount<=h.normal?0:harshCount>=h.critical?100:clamp((harshCount-h.normal)/(h.critical-h.normal)*100,0,100)); }
     return parts.length?Math.max.apply(null,parts):null;
   }
@@ -253,7 +256,7 @@ geotab.addin.vehicleHealth = () => {
   ];
   const kpisFor = () => TAB==="breakdown" ? KPI_BD : KPI_EM;
 
-  const SWATCH = { r:"#E0533A", o:"#F08A3C", a:"#F0B429", c:"#5B9BD5", t:"#1FA8BE", g:"#8FC73E", x:"#9AA4B2" };
+  const SWATCH = { r:"#B42318", o:"#B54708", a:"#854A0E", c:"#175CD3", t:"#107569", g:"#2D6A2F", x:"#98A2B3" };
   const TERM_LABEL = { DTC:"Faults", T:"Temp", P:"Pressure", U:"Usage", M:"Maint", B:"Battery" };
 
   // Inline SVG icons (rendered inside <body>, which the add-in loader keeps). 16px, currentColor.
@@ -477,7 +480,7 @@ geotab.addin.vehicleHealth = () => {
           });
           LOADING=false; lockRefresh(false); LAST_UPDATED=new Date(); SECTION_LIMIT={};
           renderAll();
-          const trunc = TRUNC.length ? " \u00b7 <b style=\"color:#F0B429\">\u26a0 "+TRUNC.join("/")+" truncated \u2014 narrow window/group</b>" : "";
+          const trunc = TRUNC.length ? " \u00b7 <b style=\"color:#B54708\">\u26a0 "+TRUNC.join("/")+" truncated \u2014 narrow window/group</b>" : "";
           setStatus("<b>"+COMPUTED.length+"</b> vehicles \u00b7 "+WINDOW_DAYS+"-day window \u00b7 <b>"+active.length+"</b> signals resolved"+trunc);
           announce(COMPUTED.length+" vehicles loaded. "+actionNeededCount()+" need attention."+(TRUNC.length?" Warning: some results were truncated.":""));
           enrichVins();
@@ -570,10 +573,19 @@ geotab.addin.vehicleHealth = () => {
         +'<span class="kl">'+esc(k.label)+'</span>'
         +'<span class="kn">'+n+'</span>'
         +'<span class="kp"><b>'+pct+'%</b> of fleet</span></button>'; }).join("");
+    const segs=kpis.map(k=>({ n:k.set.reduce((a,d)=>a+(c[d]||0),0), cls:k.cls, label:k.label }));
+    const kpiSum=segs.reduce((a,s)=>a+s.n,0);
+    const rem=Math.max(0,total-kpiSum);
+    const stripSegs=segs.concat(rem>0?[{n:rem,cls:"x",label:"No data"}]:[]).filter(s=>s.n>0);
+    const stripDen=stripSegs.reduce((a,s)=>a+s.n,0)||1;
+    const strip = total ? '<div class="vh-dist" role="img" aria-label="Fleet distribution by status">'
+      + stripSegs.map(s=>'<span class="vh-dist-seg" style="flex:'+s.n+';background:'+SWATCH[s.cls]+'" title="'+esc(s.label)+': '+s.n+' ('+Math.round(s.n/stripDen*100)+'%)"></span>').join("")
+      + '</div>' : "";
     wrap.innerHTML=
       '<div class="vh-overview"><div class="vh-ov-l"><b>'+need+'</b> need attention <span class="vh-ov-sep">\u00b7</span> '+total+' vehicles</div>'
       +'<div class="vh-ov-r">'+(upd?esc(upd):"")+'</div></div>'
-      +'<div class="vh-kpis" role="group" aria-label="Filter vehicles by status">'+cards+'</div>';
+      +'<div class="vh-kpis" role="group" aria-label="Filter vehicles by status">'+cards+'</div>'
+      +strip;
     wrap.querySelectorAll("[data-kpi]").forEach(b=>b.addEventListener("click",()=>{ const id=b.getAttribute("data-kpi");
       if(FILTER_ID==="kpi:"+id) setFilter("all",null);
       else { const k=kpisFor().find(x=>x.id===id); setFilter("kpi:"+id,new Set(k.set)); } }));
@@ -588,9 +600,10 @@ geotab.addin.vehicleHealth = () => {
   function contribHTML(terms){ const tops=topContributors(terms);
     if(!tops.length) return '<span class="vh-chip chip-none">No active factors</span>';
     return tops.map(t=>chip(t.label,t.v)).join(""); }
-  function scoreMini(v){ if(v==null) return '<span class="vh-score na" aria-label="no data">\u2014</span>';
-    return '<span class="vh-score" aria-label="'+Math.round(v)+' of 100"><b>'+Math.round(v)+'</b>'
-      +'<span class="vh-track"><i class="fb-'+fbClass(v)+'" style="width:'+Math.max(4,Math.round(v))+'%"></i></span></span>'; }
+  function scoreMini(v,cls){ if(v==null) return '<span class="vh-score na" aria-label="no data">\u2014</span>';
+    const col=SWATCH[cls]||SWATCH.x;
+    return '<span class="vh-score" aria-label="'+Math.round(v)+' of 100, lower is healthier"><b style="color:'+col+'">'+Math.round(v)+'</b>'
+      +'<span class="vh-track"><i style="width:'+Math.max(4,Math.round(v))+'%;background:'+col+'"></i></span></span>'; }
 
   function rowHTML(r,a){
     const dev=r.deviceFaultCount?' <span class="vh-tag" title="Telematics device fault recorded \u2014 excluded from score">device</span>':'';
@@ -604,7 +617,7 @@ geotab.addin.vehicleHealth = () => {
       const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+", risk score "+(r.score==null?"no data":Math.round(r.score)+" of 100")+". Activate for details.");
       return '<div class="vh-row bd'+(r.noData?" nodata":"")+'" role="button" tabindex="0" data-id="'+esc(r.id)+'" aria-label="'+aria+'">'
         +head+'<span class="vh-contrib">'+mid+'</span>'
-        +'<span class="vh-scorecell">'+scoreMini(r.score)+'</span>'
+        +'<span class="vh-scorecell">'+scoreMini(r.score,a.cls)+'</span>'
         +'<span class="vh-chev" aria-hidden="true">'+svg("chevron",15)+'</span></div>';
     }
     const finding = r.noData ? (r.noDataReason||"No data") : ((r.em.detail&&r.em.detail.length)?r.em.detail[0]:(r.em.score===0?"No issues detected":"\u2014"));
@@ -627,7 +640,7 @@ geotab.addin.vehicleHealth = () => {
     const byAction={}; rows.forEach(r=>{ const d=dispOf(r); (byAction[d]=byAction[d]||[]).push(r); });
     const order=actionsFor();
     const colhead = TAB==="breakdown"
-      ? '<div class="vh-colhead bd"><span></span><span>Vehicle</span><span>Top risk factors</span><span class="ralign">Risk score</span><span></span></div>'
+      ? '<div class="vh-colhead bd"><span></span><span>Vehicle</span><span>Top risk factors</span><span class="ralign">Risk score <span class="vh-colhint">lower = healthier</span></span><span></span></div>'
       : '<div class="vh-colhead em"><span></span><span>Vehicle</span><span>Finding</span><span class="ralign">CO\u2082 (kg)</span><span></span></div>';
 
     let html=colhead;
@@ -692,8 +705,28 @@ geotab.addin.vehicleHealth = () => {
     if(v==null) return '<div class="vh-trm na"><span class="lab">'+esc(label)+'</span><span class="tk"></span><span class="v">\u2014</span></div>';
     return '<div class="vh-trm"><span class="lab">'+esc(label)+'</span><span class="tk"><i class="fb-'+fbClass(v)+'" style="width:'+Math.max(3,Math.round(v))+'%"></i></span><span class="v">'+Math.round(v)+'</span></div>'; }
 
+  // Labeled gauge that anchors the breakdown score: 0-100 scale, banded track, marker, action-colored value.
+  function riskGauge(r){
+    const am=ACTIONS_BD.find(a=>a.id===r.disp)||{cls:"x"}; const acol=SWATCH[am.cls]||SWATCH.x;
+    if(r.score==null){
+      return '<div class="vh-gauge nodata"><div class="vh-gauge-top"><span class="vh-gauge-num na">\u2014</span>'
+        +'<span class="vh-gauge-sub">no engine data to score</span></div></div>';
+    }
+    const v=Math.round(r.score), pos=clamp(v,0,100);
+    const urgent=(r.disp==="Service now"||r.disp==="Remove from service");
+    const note=(urgent && v<60)
+      ? '<div class="vh-gauge-note">Overall risk is '+(v<40?"low":"moderate")+'. This vehicle is flagged \u201c'+esc(r.disp)+'\u201d because of a specific active fault, not its composite score.</div>'
+      : '';
+    return '<div class="vh-gauge">'
+      +'<div class="vh-gauge-top"><span class="vh-gauge-num" style="color:'+acol+'">'+v+'<span class="vh-gauge-max">/100</span></span>'
+      +'<span class="vh-gauge-sub">breakdown-risk index \u00b7 lower is healthier</span></div>'
+      +'<div class="vh-gauge-track"><span class="vh-gauge-mark" style="left:'+pos+'%"></span></div>'
+      +'<div class="vh-gauge-ticks"><span>0</span><span>50</span><span>100</span></div>'
+      +note+'</div>';
+  }
+
   function breakdownSection(r){
-    const w=CONFIG.weights, score=r.score==null?'\u2014':Math.round(r.score);
+    const w=CONFIG.weights;
     const factors='<div class="vh-terms">'
       +termRow("Faults \u00b7 "+(w.DTC*100)+"%","DTC",r.terms)+termRow("Temp \u00b7 "+(w.T*100)+"%","T",r.terms)
       +termRow("Pressure \u00b7 "+(w.P*100)+"%","P",r.terms)+termRow("Usage \u00b7 "+(w.U*100)+"%","U",r.terms)
@@ -710,8 +743,8 @@ geotab.addin.vehicleHealth = () => {
     if(r.deviceFaultCount)notes.push(r.deviceFaultCount+" telematics device record(s) (excluded from score).");
     const ns=notes.length?'<ul class="vh-notes">'+notes.map(n=>'<li>'+esc(n)+'</li>').join("")+'</ul>':'';
     const gr=r.geotabRisk!=null?'<div class="vh-callout" style="margin-bottom:12px">Geotab predicted breakdown risk: <b>'+Math.round(r.geotabRisk)+'%</b> <span class="vh-muted">(Geotab\u2019s own model, shown for comparison)</span></div>':'';
-    return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Breakdown risk</h4><div class="vh-dsec-meta">'+pill(r.disp)
-      +'<span class="vh-dscore" style="color:'+(r.score==null?"#9aa3c4":SWATCH[fbClass(r.score)])+'">'+score+'</span></div></div>'
+    return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Breakdown risk</h4><div class="vh-dsec-meta">'+pill(r.disp)+'</div></div>'
+      +riskGauge(r)
       +gr
       +'<div class="vh-dsub">Top risk factors (weight)</div>'+factors
       +'<div class="vh-dsub">Diagnostic faults</div>'+faults
@@ -725,7 +758,7 @@ geotab.addin.vehicleHealth = () => {
       carbon='<div class="vh-callout"><b>'+fmtInt(r.co2.totalKg)+' kg</b> total \u00b7 <b>'+fmtInt(r.co2.idleKg)+' kg</b> from idling'+(r.co2.idleWaste?' \u26a0 high idle waste':'')+ph
         +'<br><span class="vh-muted">Fuel-derived estimate \u2014 use the Geotab Sustainability Center for certified figures.</span></div>'; }
     return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Emissions health</h4><div class="vh-dsec-meta">'+pill(em.disp)
-      +'<span class="vh-dscore" style="color:'+(em.score==null?"#9aa3c4":SWATCH[fbClass(em.score)])+'">'+score+'</span></div></div>'
+      +'<span class="vh-dscore" style="color:'+(em.score==null?"#98A2B3":SWATCH[fbClass(em.score)])+'">'+score+'</span></div></div>'
       +'<div class="vh-dsub">Findings</div>'+lines
       +(carbon?'<div class="vh-dsub">Carbon estimate</div>'+carbon:'')+'</section>';
   }
