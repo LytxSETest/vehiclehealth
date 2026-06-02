@@ -13,9 +13,6 @@
   Brand: Lytx palette + Open Sans. Logo is NOT recreated — text wordmark with a slot
   for the official asset (see .vh-brand in body) + required attribution in footer.
 -->
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Open+Sans:ital,wght@0,300..800;1,400&display=swap" rel="stylesheet">
 <style>
   #vh-app {
     --c-darkblue:#1F1446; --c-lightblue:#009CDE; --c-lightblue-2:#6ED4FF;
@@ -128,7 +125,7 @@
     background:rgba(0,0,0,.26); border:1px solid var(--line-2); border-radius:var(--r-sm); padding:8px 11px 8px 31px; }
   .vh-search input::placeholder{ color:var(--fg-3); }
   .vh-search input:focus{ border-color:var(--accent); outline:none; }
-  .vh-search svg{ position:absolute; left:9px; top:50%; transform:translateY(-50%); opacity:.55; }
+  .vh-search .vh-sicon{ position:absolute; left:9px; top:50%; transform:translateY(-50%); color:var(--fg-3); font-size:15px; }
 
   .vh-filters{ display:flex; gap:7px; flex-wrap:wrap; }
   .vh-fpill{ font-family:inherit; font-size:12px; font-weight:600; color:var(--fg-2); cursor:pointer;
@@ -757,17 +754,20 @@ geotab.addin.vehicleHealth = () => {
   // ========================= lifecycle =========================
   return {
     initialize(api,state,callback){ API=api; STATE=state;
-      el("vh-window").value=String(CONFIG.faultLookbackDays);
-      el("vh-refresh").addEventListener("click",run);
-      el("vh-window").addEventListener("change",run);
-      el("vh-tab-bd").addEventListener("click",()=>setTab("breakdown"));
-      el("vh-tab-em").addEventListener("click",()=>setTab("emissions"));
-      el("vh-export").addEventListener("click",exportCSV);
-      el("vh-scrim").addEventListener("click",closeDrawer);
-      document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeDrawer(); });
-      const si=el("vh-search"); let t=null;
-      si.addEventListener("input",()=>{ SEARCH=si.value.trim(); PAGE=0; clearTimeout(t); t=setTimeout(renderTable,120); });
-      callback();
+      try{
+        const on=(id,ev,fn)=>{ const e=el(id); if(e)e.addEventListener(ev,fn); };
+        const w=el("vh-window"); if(w)w.value=String(CONFIG.faultLookbackDays);
+        on("vh-refresh","click",run);
+        on("vh-window","change",run);
+        on("vh-tab-bd","click",()=>setTab("breakdown"));
+        on("vh-tab-em","click",()=>setTab("emissions"));
+        on("vh-export","click",exportCSV);
+        on("vh-scrim","click",closeDrawer);
+        document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeDrawer(); });
+        const si=el("vh-search"); let t=null;
+        if(si)si.addEventListener("input",()=>{ SEARCH=si.value.trim(); PAGE=0; clearTimeout(t); t=setTimeout(renderTable,120); });
+      }catch(e){ console.error("[VehicleHealth] init",e); }
+      if(callback)callback();
     },
     focus(api,state){ API=api; STATE=state; run(); },
     blur(){ closeDrawer(); }
@@ -777,7 +777,7 @@ geotab.addin.vehicleHealth = () => {
 </head>
 <body>
   <div id="vh-app">
-    <header class="vh-header">
+    <div class="vh-header">
       <!-- Brand: official logo NOT recreated per Lytx guidelines. To use the official asset,
            replace the .vh-brand contents with:
            <img src="lytx-with-geotab-white.svg" alt="Lytx+ with Geotab" style="height:26px"> -->
@@ -803,17 +803,17 @@ geotab.addin.vehicleHealth = () => {
         </label>
         <button id="vh-refresh" class="vh-btn" type="button">Refresh</button>
       </div>
-    </header>
-    <main class="vh-main">
+    </div>
+    <div class="vh-main">
       <p id="vh-status" class="vh-status"></p>
-      <section id="vh-summary" class="vh-summary"></section>
-      <section class="vh-panel">
+      <div id="vh-summary" class="vh-summary"></div>
+      <div class="vh-panel">
         <div class="vh-panel-head">
           <div><h2 id="vh-panel-title" style="display:inline">Vehicle detail</h2><span id="vh-count" class="vh-count"></span></div>
           <div class="vh-tools">
             <div id="vh-filters" class="vh-filters"></div>
             <div class="vh-search">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#cdd4e6" stroke-width="2"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <span class="vh-sicon" aria-hidden="true">&#8981;</span>
               <input id="vh-search" type="text" placeholder="Search vehicle&hellip;" aria-label="Search vehicle" />
             </div>
             <button id="vh-export" class="vh-btn vh-btn-ghost" type="button">Export CSV</button>
@@ -821,15 +821,15 @@ geotab.addin.vehicleHealth = () => {
         </div>
         <div id="vh-tablewrap" class="vh-tablewrap"></div>
         <div id="vh-pager" class="vh-pager"></div>
-      </section>
-    </main>
-    <footer class="vh-footer">
+      </div>
+    </div>
+    <div class="vh-footer">
       <div class="tag">Protecting a world in motion</div>
       <div class="note">Scores are operational triage signals, not certified diagnostics &mdash; tune thresholds in CONFIG. CO&#8322; figures are fuel-derived estimates; use the Geotab Sustainability Center for certified reporting.</div>
       <div class="note">&ldquo;Lytx+&rdquo; and the Lytx+ logo are trademarks of Lytx, Inc. &ldquo;Geotab&rdquo; and the Geotab logo are registered trademarks of Geotab, Inc. in the United States and other countries.</div>
-    </footer>
-  </div>
+    </div>
   <div id="vh-scrim" class="vh-scrim"></div>
-  <aside id="vh-drawer" class="vh-drawer" role="dialog" aria-label="Vehicle detail"></aside>
+  <div id="vh-drawer" class="vh-drawer" role="dialog" aria-label="Vehicle detail"></div>
+  </div>
 </body>
 </html>
