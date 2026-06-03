@@ -6,7 +6,7 @@ geotab.addin.vehicleHealth = () => {
     bands: [ [90,"High risk","vhs-b-high"], [75,"Priority maint.","vhs-b-priority"],
              [60,"Schedule inspection","vhs-b-inspect"], [40,"Monitor","vhs-b-monitor"],
              [0,"Normal","vhs-b-normal"] ],
-    maxDevices: 2000, faultLookbackDays: 30, statusLookbackDays: 7, statusLookbackFastDays: 3, statusLookbackSlowDays: 30, pageSize: 25,
+    maxDevices: 50000, faultLookbackDays: 30, statusLookbackDays: 7, statusLookbackFastDays: 3, statusLookbackSlowDays: 30, pageSize: 25,
     faultLimit: 50000, exceptionLimit: 50000, dvirLimit: 10000, ruleLimit: 2000, statusLimit: 500,
     batteryFaultKeywords: ["battery","low voltage"],
     deviceFaultKeywords:  ["device","restarted","power was removed","gps","antenna","tamper","telematics"],
@@ -42,6 +42,9 @@ geotab.addin.vehicleHealth = () => {
       monO2:        { id:"aQlf26vuLj06djxfNj-9rIQ", keyword:"oxygen sensor monitor complete" },
       monEGR:       { id:"a2cJr2HdL9UiQeEcvYL_Wkw", keyword:"egr system monitor complete" },
       monMisfire:   { id:"aDn7Ky78pnUmai2B3dmPmqQ", keyword:"misfire monitor complete" },
+      monEvap:      { keyword:"evaporative system monitor complete" },
+      monSecAir:    { keyword:"secondary air system monitor complete" },
+      monFuelSys:   { keyword:"fuel system monitor complete" },
       dpfSoot:      { keyword:"particulate filter 1 soot", dir:"high", normal:60, critical:90 },
       defLevel:     { keyword:"def level", dir:"low", normal:20, critical:5 },
       dpfIntakeTemp:{ keyword:"diesel particulate filter intake gas temperature" },
@@ -50,6 +53,14 @@ geotab.addin.vehicleHealth = () => {
       dpfRegen:     { keyword:"diesel particulate filter regeneration status" },
       regenInhibit: { keyword:"aft regen inhibit status" },
       noxIn:        { keyword:"aftertreatment 1 intake nox", dir:"high" }, noxOut: { keyword:"aftertreatment 1 outlet nox", dir:"high" },
+      // ---- auto-detected profile / classification (presence or value; not scored) ----
+      dieselDetected:{ keyword:"diesel engine detected" },
+      vehClass:     { keyword:"vehicle class for safety metrics" },
+      gcvw:         { keyword:"gross combination vehicle weight" },
+      ptoEngaged:   { keyword:"power takeoff engaged" },
+      absEquipped:  { keyword:"generic abs active" },
+      adasEquipped: { keyword:"adas forward collision status" },
+      tpmsEquipped: { keyword:"tire pressure: axle 1 tire 1" },
       predictedRisk:{ id:"DiagnosticPredictedRiskOfBreakdownId", keyword:"predicted breakdown risk" }, // Geotab's own model (info only, not scored)
     },
     // ---- usage / harsh normalisation ----
@@ -219,7 +230,8 @@ geotab.addin.vehicleHealth = () => {
     v:1,
     harsh:{ normal:CONFIG.harshRate.normal, critical:CONFIG.harshRate.critical },
     idle:{ normal:CONFIG.idleRatio.normal, critical:CONFIG.idleRatio.critical },
-    staleHours:CONFIG.staleHours
+    staleHours:CONFIG.staleHours,
+    weights: Object.assign({}, CONFIG.weights)
   }; }
   const PRESETS = {
     harsh: { high:{normal:10,critical:60},   medium:{normal:20,critical:120}, low:{normal:40,critical:200} },
@@ -241,7 +253,12 @@ geotab.addin.vehicleHealth = () => {
     let inn=clamp(n(raw.idle&&raw.idle.normal,d.idle.normal),0,0.95);
     let ic=clamp(n(raw.idle&&raw.idle.critical,d.idle.critical),0,1); if(ic<=inn)ic=Math.min(1,inn+0.01);
     let sh=clamp(Math.round(n(raw.staleHours,d.staleHours)),1,720);
-    return { v:1, harsh:{normal:hn,critical:hc}, idle:{normal:inn,critical:ic}, staleHours:sh };
+    // weights: clamp each factor to 0..1; if everything is zero, fall back to defaults (combine renormalises).
+    const dw=d.weights, rw=(raw.weights&&typeof raw.weights==="object")?raw.weights:{};
+    const w={}; let wsum=0;
+    for(const k in dw){ let v=n(rw[k],dw[k]); if(!(v>=0))v=dw[k]; v=clamp(v,0,1); w[k]=Math.round(v*100)/100; wsum+=w[k]; }
+    if(wsum<=0){ for(const k in dw) w[k]=dw[k]; }
+    return { v:1, harsh:{normal:hn,critical:hc}, idle:{normal:inn,critical:ic}, staleHours:sh, weights:w };
   }
 
   // A user may CHANGE shared settings only with elevated clearance. Built-in Administrator/Supervisor/Manager
@@ -337,7 +354,7 @@ geotab.addin.vehicleHealth = () => {
     return d;
   }
 
-  function combine(terms){ let w=0,a=0; for(const k in CONFIG.weights){ const v=terms[k]; if(v==null)continue; w+=CONFIG.weights[k]; a+=CONFIG.weights[k]*v; } return w===0?null:a/w; }
+  function combine(terms){ const W=(SETTINGS&&SETTINGS.weights)||CONFIG.weights; let w=0,a=0; for(const k in W){ const v=terms[k]; if(v==null)continue; w+=W[k]; a+=W[k]*v; } return w===0?null:a/w; }
   function band(score){ if(score==null)return ["Unknown","vhs-b-unknown"]; for(const b of CONFIG.bands) if(score>=b[0])return [b[1],b[2]]; return ["Normal","vhs-b-normal"]; }
   function disposition(items,terms){
     terms=terms||{};
@@ -361,31 +378,38 @@ geotab.addin.vehicleHealth = () => {
   const dispRank=d=>DISP_RANK[d]!=null?DISP_RANK[d]:0;
 
   // ---- emissions (Section 2) ----
-  function emissionsHealth(s){
+  function emissionsHealth(s, faults){
     const rows=[], detail=[], parts=[];
     let worstState="ok"; const RANK={ok:0,recheck:1,attention:2};
     const bump=st=>{ if(RANK[st]>RANK[worstState])worstState=st; };
-    const monKeys=["monCatalyst","monO2","monEGR","monMisfire"];
+    const monKeys=["monCatalyst","monO2","monEGR","monMisfire","monEvap","monSecAir","monFuelSys"];
     const hasMon = monKeys.some(k=>s[k]!=null) || s.milDistance!=null;
     const hasDiesel = s.defLevel!=null||s.dpfIntakeTemp!=null||s.dpfOutletTemp!=null||s.dpfIntakePress!=null||s.dpfRegen!=null||s.dpfSoot!=null||(s.noxIn!=null&&s.noxOut!=null);
-    const kind = hasMon ? "gas" : (hasDiesel ? "diesel" : "none");
+    // Diesel takes priority: a diesel that also reports OBD monitors should still show aftertreatment, not gas readiness.
+    const kind = hasDiesel ? "diesel" : (hasMon ? "gas" : "none");
     let headline="";
 
     if(kind==="gas"){
-      // Inspection readiness: OBD-II monitor completion + MIL + recent-code-clear masking.
+      // Inspection readiness: OBD-II monitor completion + MIL + catalyst fault + recent-code-clear masking.
       const milOn = s.milDistance!=null && s.milDistance>0;
+      const catFault = (faults||[]).some(f=>/catalyst.*efficiency below threshold/i.test(f.name||""));
       if(milOn){ parts.push(80); bump("attention"); detail.push("Check-engine (MIL) on"); rows.push({label:"Check-engine light",value:"on",state:"attention"}); }
       else if(s.milDistance!=null){ rows.push({label:"Check-engine light",value:"off",state:"ok"}); }
-      const monLabel={monCatalyst:"Catalyst monitor",monO2:"O\u2082 sensor monitor",monEGR:"EGR monitor",monMisfire:"Misfire monitor"};
+      const monLabel={monCatalyst:"Catalyst monitor",monO2:"O\u2082 sensor monitor",monEGR:"EGR monitor",monMisfire:"Misfire monitor",monEvap:"EVAP monitor",monSecAir:"Secondary air monitor",monFuelSys:"Fuel system monitor"};
       let incomplete=0,have=0; const incNames=[];
       monKeys.forEach(k=>{ const v=s[k]; if(v!=null){ have++; const done=v!==0; if(!done){incomplete++; incNames.push(monLabel[k].replace(" monitor",""));} rows.push({label:monLabel[k],value:done?"complete":"not complete",state:done?"ok":"recheck"}); } });
       if(incomplete>0){ parts.push(Math.min(30,incomplete*10)); bump("recheck"); detail.push(incomplete+" of "+have+" readiness monitors incomplete"); }
       const recentClear = s.distSinceClear!=null && s.distSinceClear>=0 && s.distSinceClear<16000; // <~10 mi
       let masking=false;
       if(recentClear && incomplete>0){ parts.push(40); masking=true; detail.push("Codes cleared recently, monitors not yet re-run \u2014 recent repair or possible masking"); rows.push({label:"Recent code clear",value:"yes \u2014 monitors not re-run",state:"recheck"}); }
+      // Catalytic converter line = the ECU's own verdict: catalyst monitor + P0420/P0430.
+      if(catFault){ parts.push(80); bump("attention"); detail.push("Catalyst efficiency fault (P0420/P0430)"); rows.push({label:"Catalytic converter",value:"efficiency fault (P0420/P0430)",state:"attention"}); }
+      else if(s.monCatalyst===0){ rows.push({label:"Catalytic converter",value:"monitor not yet complete",state:"recheck"}); }
+      else if(s.monCatalyst!=null){ rows.push({label:"Catalytic converter",value:"no efficiency fault",state:"ok"}); }
       if(milOn) headline="Check-engine light on \u2014 would fail an emissions inspection.";
-      else if(incomplete>0) headline="Not ready for inspection \u2014 "+incNames.join(" and ")+" monitor"+(incNames.length>1?"s":"")+" not complete."+(masking?" Codes were cleared recently, so this could be a recent repair or could be masking a fault \u2014 recheck after a full drive cycle.":" Recheck after a full drive cycle.");
-      else if(have>0) headline="Inspection-ready \u2014 readiness monitors complete, no check-engine light.";
+      else if(catFault) headline="Catalytic converter efficiency fault (P0420/P0430) \u2014 would fail an emissions inspection.";
+      else if(incomplete>0) headline="Not ready for inspection \u2014 "+incNames.join(", ")+" monitor"+(incNames.length>1?"s":"")+" not complete."+(masking?" Codes were cleared recently, so this could be a recent repair or could be masking a fault \u2014 recheck after a full drive cycle.":" Recheck after a full drive cycle.");
+      else if(have>0) headline="Inspection-ready \u2014 all reported readiness monitors complete, no check-engine light.";
       else headline="No OBD readiness data reported.";
     } else if(kind==="diesel"){
       // Aftertreatment: DEF level + DPF regen state + DPF readings (soot/NOx only if the vehicle reports them).
@@ -407,7 +431,7 @@ geotab.addin.vehicleHealth = () => {
       else if(s.defLevel!=null && s.defLevel<def.normal) headline="DEF low \u2014 refill soon.";
       else if(s.regenInhibit!=null && s.regenInhibit!==0) headline="DPF regeneration is inhibited \u2014 soot can build up; clear the inhibit when safe.";
       else if(dpf!=null && dpf>=100) headline="DPF soot load very high \u2014 service the particulate filter.";
-      else headline="Aftertreatment normal"+(s.dpfRegen!=null&&s.dpfRegen!==0?" \u2014 DPF regenerating now.":".");
+      else headline=(s.dpfRegen!=null&&s.dpfRegen!==0)?"DPF is regenerating now \u2014 no aftertreatment alerts from reported signals.":"No aftertreatment alerts from reported signals.";
     } else {
       return { score:null, disp:"No data", state:"none", kind:"none", headline:"No emissions data reported.", rows:[], detail:[] };
     }
@@ -488,12 +512,25 @@ geotab.addin.vehicleHealth = () => {
     close:'<line x1="5" y1="5" x2="17" y2="17"/><line x1="17" y1="5" x2="5" y2="17"/>',
     download:'<path d="M11 3v10"/><polyline points="6.5,9 11,13.5 15.5,9"/><line x1="4" y1="18" x2="18" y2="18"/>',
     gear:'<circle cx="11" cy="11" r="3"/><path d="M11 1.8v2.4M11 17.8v2.4M2.2 11h2.4M17.4 11h2.4M4.8 4.8l1.7 1.7M15.5 15.5l1.7 1.7M4.8 17.2l1.7-1.7M15.5 6.5l1.7-1.7"/>',
+    engine:'<path d="M4 8.5h7V6.5h4.5v2H17l2-1.6V10h1.2v3.2H19v3.3l-2-1.6h-2.5"/><path d="M4 8.5v6.5h3.2L11 18h3.5v-3.5H4z"/><path d="M4 11.5H2v2h2"/>',
+    temp:'<path d="M13 12.4V6a2 2 0 1 0-4 0v6.4a3.6 3.6 0 1 0 4 0z"/><line x1="11" y1="7.5" x2="11" y2="12.8"/>',
+    gauge:'<path d="M3.6 15.5a8 8 0 1 1 14.8 0"/><line x1="11" y1="15.5" x2="14.6" y2="9.2"/><circle cx="11" cy="15.5" r="1.4"/>',
+    wheel:'<circle cx="11" cy="11" r="8"/><circle cx="11" cy="11" r="2.3"/><line x1="11" y1="3" x2="11" y2="8.7"/><line x1="4.2" y1="15.4" x2="9" y2="12.4"/><line x1="17.8" y1="15.4" x2="13" y2="12.4"/>',
+    battery:'<rect x="2.5" y="7" width="15" height="9" rx="1.6"/><path d="M17.5 9.8h2v3.4h-2"/><line x1="6.5" y1="9.7" x2="6.5" y2="13.3"/><line x1="10.5" y1="9.7" x2="10.5" y2="13.3"/>',
+    filter:'<path d="M3 4.5h16l-6.3 7.5v5.2l-3.4 1.8v-7z"/>',
   };
   const svg = (name, sz) => '<svg class="vh-i" width="'+(sz||16)+'" height="'+(sz||16)+'" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'+(ICON[name]||"")+'</svg>';
 
   // ========================= state =========================
   let API=null, STATE=null, NAME_BY_ID={}, GROUP_BY_ID={}, FM_BY_ID={}, COMPUTED=[], LOADING=false, LAST_UPDATED=null, DB="";
   let TAB="breakdown", VIEW="list", FILTER=null, FILTER_ID="all", SEARCH="", WINDOW_DAYS=30;
+  // Multi-facet filters that AND-combine with each other and with the disposition pills/KPIs. Each facet is a
+  // Set of selected keys (empty = unconstrained); chips within a facet OR together. factor/band are breakdown-only.
+  let FACETS = { factor:new Set(), band:new Set(), fuel:new Set(), group:new Set() };
+  let FILTERS_OPEN = false;
+  // Side-by-side vehicle compare: a selection set (max 4) populated by tapping rows while compare mode is on.
+  let COMPARE_MODE = false, COMPARE_SET = [];
+  const COMPARE_MAX = 4;
   let COLLAPSED={};          // `${tab}:${actionId}` -> true if collapsed
   let SECTION_LIMIT={};      // `${tab}:${actionId}` -> rows currently shown
   let LAST_FOCUS=null;       // element focus returns to after the drawer closes
@@ -512,7 +549,8 @@ geotab.addin.vehicleHealth = () => {
   const pKey = () => CONFIG.persistKey + ":" + (DB||"_");
   function saveState(){
     try{ localStorage.setItem(pKey(), JSON.stringify({
-      tab:TAB, view:VIEW, filterId:FILTER_ID, windowDays:WINDOW_DAYS, collapsed:COLLAPSED
+      tab:TAB, view:VIEW, filterId:FILTER_ID, windowDays:WINDOW_DAYS, collapsed:COLLAPSED,
+      facets:{ factor:[...FACETS.factor], band:[...FACETS.band], fuel:[...FACETS.fuel], group:[...FACETS.group] }
     })); }catch(e){}
   }
   function loadState(){
@@ -524,6 +562,7 @@ geotab.addin.vehicleHealth = () => {
       if(typeof s.windowDays==="number") WINDOW_DAYS=s.windowDays;
       if(s.collapsed && typeof s.collapsed==="object") COLLAPSED=s.collapsed;
       if(s.filterId){ FILTER_ID=s.filterId; FILTER=filterSetFromId(s.filterId); }
+      if(s.facets && typeof s.facets==="object"){ ["factor","band","fuel","group"].forEach(f=>{ if(Array.isArray(s.facets[f])) FACETS[f]=new Set(s.facets[f]); }); }
     }catch(e){}
   }
   function filterSetFromId(id){
@@ -547,17 +586,35 @@ geotab.addin.vehicleHealth = () => {
   // AA-contrast text colour for a score, matching the gauge zones (green<40, teal<60, amber<75, orange<90, red).
   const bandColor = v => v==null?"#98A2B3" : v>=90?"#B42318" : v>=75?"#B54708" : v>=60?"#854A0E" : v>=40?"#107569" : "#2D6A2F";
   function normGroups(state){ const raw=(state&&state.getGroupFilter&&state.getGroupFilter())||[]; return raw.map(g=>typeof g==="string"?{id:g}:g).filter(g=>g&&g.id); }
-  const resolveId = kw => { const k=lc(kw); for(const id in NAME_BY_ID) if(lc(NAME_BY_ID[id]).indexOf(k)>-1) return id; return null; };
-  // Full Diagnostic id->name catalog, fetched once per page session. Needed so keyword-only signals
-  // (DEF, DPF temps/pressure/regen, oil pressure, etc.) resolve even when they never appear as a fault.
+  // Resolve a diagnostic id by keyword. Prefers an exact (case-insensitive) name match, else the first
+  // substring match. For analog readings, skips enumerated/indicator diagnostics ("... (1. On)") so a
+  // reading like "oil pressure" can't bind to a low-pressure warning lamp and fabricate a critical value.
+  const INDICATOR_RE = /\(-?\d+\.\s/;
+  function resolveId(kw, analog){
+    const k=lc(kw); let exact=null, sub=null;
+    for(const id in NAME_BY_ID){ const nm=NAME_BY_ID[id]; if(analog && INDICATOR_RE.test(nm)) continue;
+      const ln=lc(nm); if(ln===k){ exact=id; break; } if(sub==null && ln.indexOf(k)>-1) sub=id; }
+    return exact||sub;
+  }
+  const isAnalogSignal = cfg => !!(cfg && cfg.dir);
+  // Full Diagnostic id->name catalog, needed so keyword-only signals (DEF, DPF temps/pressure/regen, oil
+  // pressure, etc.) resolve even when they never appear as a fault. Cached in localStorage (7-day TTL) plus
+  // in memory for the session; a manual Refresh clears it. Fail-soft: a load error degrades signal
+  // resolution but does not blank the page.
   let DIAG_CAT=null;
+  const DIAG_CAT_KEY = () => "vh.diagcat."+(DB||"");
+  function clearDiagCatalog(){ DIAG_CAT=null; try{ localStorage.removeItem(DIAG_CAT_KEY()); }catch(e){} }
   function ensureDiagCatalog(done){
     if(DIAG_CAT){ NAME_BY_ID=DIAG_CAT; done(); return; }
+    try{ const raw=localStorage.getItem(DIAG_CAT_KEY()); if(raw){ const c=JSON.parse(raw);
+      if(c && c.t && (Date.now()-c.t)<7*864e5 && c.m){ DIAG_CAT=c.m; NAME_BY_ID=c.m; done(); return; } } }catch(e){}
     setStatus("Loading diagnostic catalog\u2026");
     API.call("Get",{typeName:"Diagnostic",resultsLimit:50000}, diags=>{
       const m={}; (diags||[]).forEach(d=>{ if(d&&d.id)m[d.id]=d.name||""; });
-      DIAG_CAT=m; NAME_BY_ID=m; done();
-    }, fail);
+      DIAG_CAT=m; NAME_BY_ID=m;
+      try{ localStorage.setItem(DIAG_CAT_KEY(), JSON.stringify({t:Date.now(),m:m})); }catch(e){}
+      done();
+    }, err=>{ console.warn("[VehicleHealth] diagnostic catalog load failed; degrading",err); NAME_BY_ID=NAME_BY_ID||{}; done(); });
   }
 
   // ---- vehicle identity from VIN (year deterministic; make from manufacturer prefix) ----
@@ -640,7 +697,7 @@ geotab.addin.vehicleHealth = () => {
       GROUP_BY_ID={}; (allGroups||[]).forEach(g=>{ GROUP_BY_ID[g.id]=g.name||g.id; });
       FM_BY_ID={}; (failModes||[]).forEach(m=>{ if(m&&m.id)FM_BY_ID[m.id]={code:m.code, name:m.name}; });
       // truncation guard: a Get that returns exactly its cap probably lost records
-      TRUNC=[]; if((faults||[]).length>=CONFIG.faultLimit)TRUNC.push("faults"); if((exceptions||[]).length>=CONFIG.exceptionLimit)TRUNC.push("events"); if((trips||[]).length>=CONFIG.tripLimit)TRUNC.push("trips");
+      TRUNC=[]; if((devices||[]).length>=CONFIG.maxDevices)TRUNC.push("vehicles"); if((faults||[]).length>=CONFIG.faultLimit)TRUNC.push("faults"); if((exceptions||[]).length>=CONFIG.exceptionLimit)TRUNC.push("events"); if((trips||[]).length>=CONFIG.tripLimit)TRUNC.push("trips"); if((dvirs||[]).length>=CONFIG.dvirLimit)TRUNC.push("inspections");
 
       // trips by device: distance (m), idle + drive seconds over the window
       const tripByDev={}; (trips||[]).forEach(t=>{ const dv=t.device&&t.device.id; if(!dv||!idSet.has(dv))return;
@@ -664,14 +721,12 @@ geotab.addin.vehicleHealth = () => {
         defectsByDev[dv]=(defectsByDev[dv]||0)+open; });
 
       const perDev={}; devices.forEach(d=>perDev[d.id]={vehicle:[],battery:[],device:[]});
-      const faultDiagIds=[],seenD={};
-      (faults||[]).forEach(f=>{ const dv=f.device&&f.device.id; if(!dv||!idSet.has(dv))return; const id=f.diagnostic&&f.diagnostic.id; if(id&&!seenD[id]){seenD[id]=1;faultDiagIds.push(id);} });
 
       const proceed=()=>{
         (faults||[]).forEach(f=>{ const dv=f.device&&f.device.id; if(!dv||!idSet.has(dv))return; const name=NAME_BY_ID[(f.diagnostic&&f.diagnostic.id)]||""; perDev[dv][classify(f,name)].push(f); });
 
         const sigKeys=Object.keys(CONFIG.signals);
-        const sigId={}; sigKeys.forEach(k=>{ sigId[k]=CONFIG.signals[k].id||resolveId(CONFIG.signals[k].keyword); });
+        const sigId={}; sigKeys.forEach(k=>{ sigId[k]=CONFIG.signals[k].id||resolveId(CONFIG.signals[k].keyword, isAnalogSignal(CONFIG.signals[k])); });
         const active=sigKeys.filter(k=>sigId[k]);
         // Per-signal lookback: chatty signals (coolant/voltage) need only a short window; slow accumulators
         // and monitors need a long one so a recently-parked vehicle still shows its last known value.
@@ -706,7 +761,7 @@ geotab.addin.vehicleHealth = () => {
             if(!hasData){ score=null; disp="No data"; em={score:null,disp:"No data",state:"none",kind:"none",headline:"No emissions data reported.",rows:[],detail:[]}; co2=null;
               const stale = dsi && dsi.lastComm && (Date.now()-new Date(dsi.lastComm).getTime())>SETTINGS.staleHours*3600e3;
               noDataReason = (dsi && (dsi.comm===false || stale)) ? ("Offline"+(dsi.lastComm?" \u00b7 "+timeSince(dsi.lastComm):"")) : "No engine data";
-            } else { score=combine(terms); disp=score==null?"Unknown":disposition(dtc.items,terms); em=emissionsHealth(s); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackSlowDays); }
+            } else { score=combine(terms); disp=score==null?"Unknown":disposition(dtc.items,terms); em=emissionsHealth(s,dtc.items); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackSlowDays); }
             const gids=(dev.groups||[]).map(g=>g.id).filter(id=>id && CONFIG.rootGroupIds.indexOf(id)<0);
             const gnames=gids.map(id=>GROUP_BY_ID[id]).filter(Boolean);
             const vin=dev.vehicleIdentificationNumber||null; const vd=decodeVin(vin);
@@ -717,7 +772,7 @@ geotab.addin.vehicleHealth = () => {
               vin, year, make, model, plate:dev.licensePlate||null,
               distanceMi, geotabRisk, lastComm:dsi?dsi.lastComm:null, comm:dsi?dsi.comm:null, noDataReason,
               score, terms, detail, disp, items:dtc.items, battOcc, deviceFaultCount:b.device.length,
-              harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, usageKind, em, co2, noData:!hasData };
+              harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, usageKind, em, co2, noData:!hasData, sig:s };
           });
           LOADING=false; lockRefresh(false); LAST_UPDATED=new Date(); SECTION_LIMIT={};
           renderAll();
@@ -731,12 +786,15 @@ geotab.addin.vehicleHealth = () => {
         setStatus("Reading "+calls.length+" signal series across the fleet\u2026");
         API.multiCall(calls, results => {
           const latestBy={}, firstBy={}, latestT={}, firstT={};
+          let sigTrunc=false;
           results.forEach((rows,i)=>{ const k=active[i]; if(!rows)return;
+            if(rows.length>=CONFIG.statusLimitPerDiagnostic)sigTrunc=true;
             rows.forEach(rec=>{ const dv=rec.device&&rec.device.id; if(!dv||!idSet.has(dv))return; const t=new Date(rec.dateTime).getTime();
               const lT=(latestT[dv]=latestT[dv]||{}); if(lT[k]==null||t>lT[k]){ (latestBy[dv]=latestBy[dv]||{})[k]=rec.data; lT[k]=t; }
               const fT=(firstT[dv]=firstT[dv]||{}); if(fT[k]==null||t<fT[k]){ (firstBy[dv]=firstBy[dv]||{})[k]=rec.data; fT[k]=t; }
             });
           });
+          if(sigTrunc && TRUNC.indexOf("signal readings")<0)TRUNC.push("signal readings");
           compute(latestBy,firstBy);
         }, fail);
       };
@@ -766,16 +824,40 @@ geotab.addin.vehicleHealth = () => {
   }
 
   // ========================= rendering: orchestration + summary + states =========================
-  function counts(){ const c={}; COMPUTED.forEach(r=>{ const d=dispOf(r); c[d]=(c[d]||0)+1; }); return c; }
+  function countsOver(rows){ const c={}; rows.forEach(r=>{ const d=dispOf(r); c[d]=(c[d]||0)+1; }); return c; }
   function isCollapsed(id){ const key=TAB+":"+id;
     if(Object.prototype.hasOwnProperty.call(COLLAPSED,key)) return !!COLLAPSED[key];
     return CONFIG.defaultCollapsedActions.indexOf(id)>-1; }
-  function filteredRows(){
-    let arr=COMPUTED.slice();
-    if(SEARCH){ const q=SEARCH.toLowerCase(); arr=arr.filter(r=>r.name.toLowerCase().indexOf(q)>-1 || r.groupNames.join(" ").toLowerCase().indexOf(q)>-1); }
-    if(FILTER){ arr=arr.filter(r=>FILTER.has(dispOf(r))); }
-    return arr;
+  // ---- facet model ----
+  const FACTOR_FACET = [["DTC","Engine faults"],["T","Temperature"],["P","Pressure"],["U","Usage"],["M","Maintenance"],["B","Battery"]];
+  const BAND_FACET   = [["high","High risk"],["prio","Priority maint."],["sched","Schedule inspection"],["monitor","Monitor"],["normal","Normal"]];
+  const FUEL_FACET   = [["gas","Gas"],["diesel","Diesel"]];
+  function bandKeyOf(score){ if(score==null)return null; return score>=90?"high":score>=75?"prio":score>=60?"sched":score>=40?"monitor":"normal"; }
+  // factor/band describe the breakdown-risk model only; on the emissions tab they don't apply.
+  const facetApplies = name => (name==="factor"||name==="band") ? TAB==="breakdown" : true;
+  function anyFacetActive(){ return (facetApplies("factor")&&FACETS.factor.size) || (facetApplies("band")&&FACETS.band.size) || FACETS.fuel.size || FACETS.group.size; }
+  function activeFacetChips(){ let n=0; if(facetApplies("factor"))n+=FACETS.factor.size; if(facetApplies("band"))n+=FACETS.band.size; n+=FACETS.fuel.size+FACETS.group.size; return n; }
+  function searchMatch(r,q){ return r.name.toLowerCase().indexOf(q)>-1 || r.groupNames.join(" ").toLowerCase().indexOf(q)>-1; }
+  function matchFacetsExcept(r, exclude){
+    if(exclude!=="factor" && facetApplies("factor") && FACETS.factor.size){ const t=r.terms||{}; if(![...FACETS.factor].some(k=>t[k]!=null && t[k]>=40)) return false; }
+    if(exclude!=="band" && facetApplies("band") && FACETS.band.size){ const bk=bandKeyOf(r.score); if(!bk || !FACETS.band.has(bk)) return false; }
+    if(exclude!=="fuel" && FACETS.fuel.size){ const k=r.em&&r.em.kind; if(!k || !FACETS.fuel.has(k)) return false; }
+    if(exclude!=="group" && FACETS.group.size){ const names=(r.groupNames&&r.groupNames.length)?r.groupNames:["(No group)"]; if(!names.some(n=>FACETS.group.has(n))) return false; }
+    return true;
   }
+  const matchFacets = r => matchFacetsExcept(r, null);
+  // COMPUTED filtered by search + every active filter EXCEPT `dim` (disposition/factor/band/fuel/group, or null for
+  // all). Counts for each control are taken over scopeExcept(thatControl) so chips/pills cross-reflect the OTHER
+  // active filters instead of showing stale fleet totals.
+  function scopeExcept(dim){
+    const q=SEARCH?SEARCH.toLowerCase():null;
+    return COMPUTED.filter(r=>{
+      if(q && !searchMatch(r,q)) return false;
+      if(dim!=="disposition" && FILTER && !FILTER.has(dispOf(r))) return false;
+      return matchFacetsExcept(r, dim);
+    });
+  }
+  function filteredRows(){ return scopeExcept(null); }
   function sortWithin(rows){
     rows.sort((a,b)=>{
       const sa=scoreOf(a),sb=scoreOf(b); let c=(sb==null?-1:sb)-(sa==null?-1:sa);
@@ -798,6 +880,9 @@ geotab.addin.vehicleHealth = () => {
     if(vg){ vg.classList.toggle("on",VIEW==="group"); vg.setAttribute("aria-pressed",VIEW==="group"); }
     const si=el("vh-search"); if(si && si.value!==SEARCH) si.value=SEARCH;
     renderSummary();
+    renderPills();
+    renderFilters();
+    renderCompareBar();
     if(VIEW==="group") renderGroupView(); else renderList();
     saveState();
   }
@@ -805,7 +890,7 @@ geotab.addin.vehicleHealth = () => {
   function renderSummary(){
     const wrap=el("vh-summary"); if(!wrap)return;
     if(LOADING){ wrap.innerHTML=""; return; }
-    const total=COMPUTED.length, c=counts(), kpis=kpisFor(), need=actionNeededCount(), upd=lastUpdatedText();
+    const base=scopeExcept("disposition"); const total=base.length, c=countsOver(base), kpis=kpisFor(), need=base.filter(r=>NEED.has(dispOf(r))).length, upd=lastUpdatedText();
     const cards=kpis.map((k,i)=>{ const n=k.set.reduce((a,d)=>a+(c[d]||0),0); const pct=total?Math.round(n/total*100):0; const sel=FILTER_ID==="kpi:"+k.id;
       return '<button class="vh-kpi'+(sel?" sel":"")+'" data-kpi="'+k.id+'" aria-pressed="'+(sel?"true":"false")+'" title="'+esc(k.label)+' \u2014 click to filter" style="--kc:'+HUE[k.cls]+';animation-delay:'+(i*50)+'ms">'
         +'<span class="kdot" aria-hidden="true"></span>'
@@ -831,6 +916,159 @@ geotab.addin.vehicleHealth = () => {
     wrap.querySelectorAll("[data-kpi]").forEach(b=>b.addEventListener("click",()=>{ const id=b.getAttribute("data-kpi");
       if(FILTER_ID==="kpi:"+id) setFilter("all",null);
       else { const k=kpisFor().find(x=>x.id===id); setFilter("kpi:"+id,new Set(k.set)); } }));
+  }
+
+  // Quick disposition filter pills: All + each action present in the current tab, with live counts. These share
+  // the single FILTER slot with the KPI cards - a finer, per-disposition shortcut. Shown in list and group views.
+  function renderPills(){
+    const box=el("vh-pills"); if(!box)return;
+    if(LOADING || !COMPUTED.length){ box.innerHTML=""; box.classList.remove("on"); return; }
+    const base=scopeExcept("disposition"), c=countsOver(base);
+    const present=actionsFor().filter(a=>a.id!=="Unknown" && (c[a.id]||0)>0);
+    if(!present.length){ box.innerHTML=""; box.classList.remove("on"); return; }
+    const allSel=!FILTER_ID || FILTER_ID==="all";
+    let html='<button class="vh-fpill'+(allSel?" on":"")+'" type="button" data-pill="all" aria-pressed="'+(allSel?"true":"false")+'">All <b>'+base.length+'</b></button>';
+    html+=present.map(a=>{ const id="act:"+a.id, sel=FILTER_ID===id;
+      return '<button class="vh-fpill p-'+a.cls+(sel?" on":"")+'" type="button" data-pill="'+esc(id)+'" aria-pressed="'+(sel?"true":"false")+'" title="'+esc(a.desc)+'">'
+        +'<span class="fp-dot" aria-hidden="true"></span>'+esc(a.short)+' <b>'+(c[a.id]||0)+'</b></button>'; }).join("");
+    box.innerHTML=html; box.classList.add("on");
+    box.querySelectorAll("[data-pill]").forEach(b=>b.addEventListener("click",()=>{
+      const id=b.getAttribute("data-pill");
+      if(id==="all" || FILTER_ID===id){ setFilter("all",null); return; }
+      setFilter(id, filterSetFromId(id));
+    }));
+  }
+
+  // Advanced facet filters (collapsible panel): Risk factor / Score band (breakdown only) + Fuel + Vehicle group.
+  // Multi-select; AND-combine across facets and with the disposition pills. Counts are fleet totals per chip.
+  function factorCount(k,rows){ let n=0; rows.forEach(r=>{ const v=r.terms&&r.terms[k]; if(v!=null&&v>=40)n++; }); return n; }
+  function bandCount(k,rows){ let n=0; rows.forEach(r=>{ if(bandKeyOf(r.score)===k)n++; }); return n; }
+  function fuelCount(k,rows){ let n=0; rows.forEach(r=>{ if(r.em&&r.em.kind===k)n++; }); return n; }
+  function groupChips(rows){ const m={}; rows.forEach(r=>{ const names=(r.groupNames&&r.groupNames.length)?r.groupNames:["(No group)"]; names.forEach(n=>{ m[n]=(m[n]||0)+1; }); });
+    return Object.keys(m).map(n=>({key:n,label:n,n:m[n]})).sort((a,b)=> b.n-a.n || (a.label<b.label?-1:1)); }
+  function facetGroup(title, facet, chips, hint){
+    if(!chips.length) return "";
+    return '<div class="vh-fgrp"><div class="vh-fgrp-h">'+esc(title)+'</div>'
+      + (hint?'<div class="vh-fgrp-hint">'+esc(hint)+'</div>':'')
+      + '<div class="vh-fchips">'
+      + chips.map(c=>{ const on=FACETS[facet].has(c.key);
+        return '<button class="vh-fchip'+(on?" on":"")+'" type="button" data-facet="'+esc(facet)+'" data-key="'+esc(c.key)+'" aria-pressed="'+(on?"true":"false")+'">'+esc(c.label)+(c.n!=null?' <b>'+c.n+'</b>':'')+'</button>'; }).join("")
+      + '</div></div>';
+  }
+  function renderFilters(){
+    const panel=el("vh-filters"), btn=el("vh-filters-btn"); if(!panel)return;
+    const n=activeFacetChips(), badge=el("vh-fbadge");
+    if(badge){ badge.textContent=n>0?String(n):""; badge.hidden=!(n>0); }
+    if(btn) btn.classList.toggle("hasfilters", n>0);
+    if(LOADING || !COMPUTED.length){ panel.innerHTML=""; panel.classList.remove("open"); if(btn)btn.setAttribute("aria-expanded","false"); FILTERS_OPEN=false; return; }
+    let groups="";
+    if(TAB==="breakdown"){
+      const rf=scopeExcept("factor"); groups += facetGroup("Risk factor","factor", FACTOR_FACET.map(o=>({key:o[0],label:o[1],n:factorCount(o[0],rf)})).filter(c=>c.n>0));
+      const rb=scopeExcept("band"); groups += facetGroup("Score band","band", BAND_FACET.map(o=>({key:o[0],label:o[1],n:bandCount(o[0],rb)})).filter(c=>c.n>0), "The 0\u2013100 risk index. Separate from the action filters above \u2014 a vehicle with a low score can still be flagged for service.");
+    }
+    const ru=scopeExcept("fuel"); groups += facetGroup("Fuel","fuel", FUEL_FACET.map(o=>({key:o[0],label:o[1],n:fuelCount(o[0],ru)})).filter(c=>c.n>0));
+    const rg=scopeExcept("group"); groups += facetGroup("Vehicle group","group", groupChips(rg));
+    panel.innerHTML='<div class="vh-fpanel-in">'+(groups||'<div class="vh-fgrp-h">No filterable attributes in the current data.</div>')
+      +'<div class="vh-fpanel-foot"><button class="vh-btn vh-btn-ghost vh-fclear" type="button"'+(anyFacetActive()?"":" disabled")+'>Clear filters</button>'
+      +'<span class="vh-fpanel-msg">'+filteredRows().length+' of '+COMPUTED.length+' vehicles</span></div></div>';
+    panel.classList.toggle("open", FILTERS_OPEN);
+    if(btn)btn.setAttribute("aria-expanded", FILTERS_OPEN?"true":"false");
+    panel.querySelectorAll("[data-facet]").forEach(b=>b.addEventListener("click",()=>toggleFacet(b.getAttribute("data-facet"), b.getAttribute("data-key"))));
+    const clr=panel.querySelector(".vh-fclear"); if(clr)clr.addEventListener("click",clearFacets);
+  }
+  function toggleFacet(facet,key){ const set=FACETS[facet]; if(!set)return; if(set.has(key))set.delete(key); else set.add(key);
+    SECTION_LIMIT={}; renderAll(); announce("Showing "+filteredRows().length+" vehicles"); }
+  function clearFacets(){ FACETS.factor.clear(); FACETS.band.clear(); FACETS.fuel.clear(); FACETS.group.clear();
+    SECTION_LIMIT={}; renderAll(); announce("Filters cleared"); }
+  function toggleFiltersPanel(){ FILTERS_OPEN=!FILTERS_OPEN; renderFilters(); }
+
+  // ---- side-by-side compare ----
+  function setCompareMode(on){
+    COMPARE_MODE=!!on; if(!COMPARE_MODE)COMPARE_SET=[];
+    if(COMPARE_MODE && VIEW!=="list")VIEW="list";
+    closeDrawer();
+    const b=el("vh-compare-btn"); if(b){ b.classList.toggle("on",COMPARE_MODE); b.setAttribute("aria-pressed",COMPARE_MODE?"true":"false"); }
+    renderAll();
+    announce(COMPARE_MODE?"Compare mode on. Select up to "+COMPARE_MAX+" vehicles.":"Compare mode off.");
+  }
+  function toggleCompare(id){
+    const i=COMPARE_SET.indexOf(id);
+    if(i>-1) COMPARE_SET.splice(i,1);
+    else { if(COMPARE_SET.length>=COMPARE_MAX){ announce("You can compare up to "+COMPARE_MAX+" vehicles."); return; } COMPARE_SET.push(id); }
+    renderAll();
+  }
+  function clearCompare(){ COMPARE_SET=[]; renderAll(); }
+  function renderCompareBar(){
+    const bar=el("vh-comparebar"); if(!bar)return;
+    if(!COMPARE_MODE || LOADING){ bar.innerHTML=""; bar.classList.remove("on"); return; }
+    const chips=COMPARE_SET.map(id=>{ const r=COMPUTED.find(x=>x.id===id); const nm=r?r.name:id;
+      return '<span class="vh-cchip">'+esc(nm)+'<button type="button" class="vh-cx" data-cclear="'+esc(id)+'" aria-label="Remove '+esc(nm)+'">'+svg("close",12)+'</button></span>'; }).join("");
+    bar.innerHTML='<span class="vh-cbar-lab">Compare \u00b7 '+COMPARE_SET.length+'/'+COMPARE_MAX+' selected</span>'
+      +'<span class="vh-cbar-chips">'+(chips||'<span class="vh-muted">Tap vehicles in the list to add them.</span>')+'</span>'
+      +'<span class="sp" style="flex:1"></span>'
+      +'<button class="vh-btn vh-btn-ghost vh-cbar-clear" type="button"'+(COMPARE_SET.length?"":" disabled")+'>Clear</button>'
+      +'<button class="vh-btn vh-cbar-go" type="button"'+(COMPARE_SET.length>=2?"":" disabled")+'>Compare '+(COMPARE_SET.length>=2?"("+COMPARE_SET.length+")":"")+'</button>';
+    bar.classList.add("on");
+    bar.querySelectorAll("[data-cclear]").forEach(b=>b.addEventListener("click",e=>{ e.stopPropagation(); toggleCompare(b.getAttribute("data-cclear")); }));
+    const cl=bar.querySelector(".vh-cbar-clear"); if(cl)cl.addEventListener("click",clearCompare);
+    const go=bar.querySelector(".vh-cbar-go"); if(go)go.addEventListener("click",openCompare);
+  }
+  function cmpScoreCell(v){ if(v==null)return '<span class="vh-muted">\u2014</span>'; const c=bandColor(v); return '<b style="color:'+c+'">'+Math.round(v)+'</b>'; }
+  function cmpSig(raw,cfg,disp){ if(raw==null)return '<span class="vh-muted">\u2014</span>'; const sev=signalBadness(raw,cfg.normal,cfg.critical,cfg.dir);
+    const c = sev==null?"#344054" : sev>=100?"#B42318" : sev>=60?"#B54708" : sev>0?"#854A0E" : "#067647"; return '<span style="color:'+c+';font-weight:700">'+esc(disp)+'</span>'; }
+  function compareRows(list){
+    const cell=(html)=>'<td>'+html+'</td>';
+    const row=(label,fn)=>'<tr><th scope="row">'+esc(label)+'</th>'+list.map(r=>cell(fn(r))).join("")+'</tr>';
+    const term=(r,k)=>{ const v=r.terms&&r.terms[k]; return v==null?'<span class="vh-muted">\u2014</span>':cmpScoreCell(v); };
+    const dr=r=>{ const d=drivability(r); const c={attention:"#B42318",recheck:"#B54708",ok:"#067647",none:"#667085"}[d.tone]; return '<span style="color:'+c+';font-weight:700">'+esc(d.label.replace(/\u2014/g,"-"))+'</span>'; };
+    const sig=r=>r.sig||{};
+    let h="";
+    h+=row("Recommended action", r=>esc(r.disp||"\u2014"));
+    h+=row("Drivability", dr);
+    h+=row("Risk score", r=>cmpScoreCell(r.score));
+    h+=row("Risk band", r=>esc(bandLabelOf(r.score)||"\u2014"));
+    h+=row("Geotab predicted risk", r=>r.geotabRisk==null?'<span class="vh-muted">\u2014</span>':Math.round(r.geotabRisk)+"%");
+    h+=row("Faults", r=>term(r,"DTC")); h+=row("Temp", r=>term(r,"T")); h+=row("Pressure", r=>term(r,"P"));
+    h+=row("Usage", r=>term(r,"U")); h+=row("Maintenance", r=>term(r,"M")); h+=row("Battery", r=>term(r,"B"));
+    h+=row("Coolant temp", r=>sig(r).coolant!=null?cmpSig(sig(r).coolant,CONFIG.signals.coolant,cToF(sig(r).coolant)+"\u00b0F"):'<span class="vh-muted">\u2014</span>');
+    h+=row("Oil pressure", r=>sig(r).oilPressure!=null?cmpSig(sig(r).oilPressure,CONFIG.signals.oilPressure,kpaToPsi(sig(r).oilPressure)+" psi"):'<span class="vh-muted">\u2014</span>');
+    h+=row("Battery voltage", r=>sig(r).deviceVoltage!=null?cmpSig(sig(r).deviceVoltage,CONFIG.signals.deviceVoltage,(Math.round(sig(r).deviceVoltage*10)/10).toFixed(1)+" V"):'<span class="vh-muted">\u2014</span>');
+    h+=row("DEF level", r=>sig(r).defLevel!=null?cmpSig(sig(r).defLevel,CONFIG.signals.defLevel,Math.round(sig(r).defLevel)+"%"):'<span class="vh-muted">\u2014</span>');
+    h+=row("Emissions", r=>esc((r.em&&r.em.disp)||"\u2014"));
+    h+=row("CO\u2082 / engine-hr", r=>r.co2&&r.co2.perHour!=null?r.co2.perHour.toFixed(1)+" kg":'<span class="vh-muted">\u2014</span>');
+    h+=row("Open defects", r=>String(r.openDefects||0));
+    h+=row("Harsh events", r=>String(r.harsh||0));
+    h+=row("Last reported", r=>r.lastComm?esc(timeSince(r.lastComm))+" ago":(r.comm===false?"Offline":'<span class="vh-muted">\u2014</span>'));
+    return h;
+  }
+  function renderCompare(){
+    const md=el("vh-compare"); if(!md)return;
+    const list=COMPARE_SET.map(id=>COMPUTED.find(x=>x.id===id)).filter(Boolean);
+    const cols=list.map(r=>{ const st=vehicleSubtitle(r); return '<th scope="col"><span class="vh-cc-nm">'+esc(r.name)+'</span>'+(st?'<span class="vh-cc-sub">'+esc(st)+'</span>':'')+'</th>'; }).join("");
+    md.innerHTML='<div class="vh-mhead"><div><h3 id="vh-compare-title">Compare vehicles</h3>'
+        +'<p>Side-by-side \u00b7 '+list.length+' vehicles. Coloured cells flag the more concerning values.</p></div>'
+        +'<button class="vh-x" type="button" aria-label="Close compare">'+svg("close",16)+'</button></div>'
+      +'<div class="vh-mbody"><div class="vh-ctable-wrap"><table class="vh-ctable"><thead><tr><th scope="col" class="vh-cc-corner">Metric</th>'+cols+'</tr></thead>'
+        +'<tbody>'+compareRows(list)+'</tbody></table></div></div>';
+    const x=md.querySelector(".vh-x"); if(x)x.addEventListener("click",closeCompare);
+  }
+  function showCompare(on){
+    const sc=el("vh-cscrim"), md=el("vh-compare");
+    if(sc)sc.classList.toggle("on",!!on);
+    if(md){ md.classList.toggle("on",!!on); md.setAttribute("aria-hidden",on?"false":"true"); }
+    if(on){ const x=md&&md.querySelector(".vh-x"); if(x&&x.focus)x.focus(); }
+    else { const b=el("vh-compare-btn"); if(b&&b.focus)b.focus(); }
+  }
+  function openCompare(){ if(COMPARE_SET.length<2)return; renderCompare(); showCompare(true); }
+  function closeCompare(){ showCompare(false); }
+  function compareKeydown(e){
+    if(e.key==="Escape"){ e.preventDefault(); closeCompare(); return; }
+    if(e.key!=="Tab")return;
+    const md=el("vh-compare"); if(!md)return;
+    const f=md.querySelectorAll("button:not([disabled])"); if(!f.length)return;
+    const first=f[0], last=f[f.length-1];
+    if(e.shiftKey&&document.activeElement===first){ e.preventDefault(); last.focus(); }
+    else if(!e.shiftKey&&document.activeElement===last){ e.preventDefault(); first.focus(); }
   }
 
   function showLoading(){ const w=el("vh-listwrap"); if(w)w.innerHTML='<div class="vh-state"><div class="vh-spin" role="status" aria-label="Loading"></div><div class="t">Loading fleet data\u2026</div><div class="d">Fetching faults, signals and events from Geotab.</div></div>'; const s=el("vh-summary"); if(s)s.innerHTML=""; }
@@ -889,27 +1127,55 @@ geotab.addin.vehicleHealth = () => {
     return '<span class="vh-score" aria-label="'+Math.round(v)+' of 100, lower is healthier"><b style="color:'+col+'">'+Math.round(v)+'</b>'
       +'<span class="vh-track"><i style="width:'+Math.max(4,Math.round(v))+'%;background:'+col+'"></i></span></span>'; }
 
+  // Vertical factor bars: a compact at-a-glance read of all six breakdown factors next to the plain-language
+  // chips. Recognisable icon per factor, bar height = the factor's 0-100 score, colour by severity band, quiet
+  // factors faded. Decorative (aria-hidden) - the chips already convey the same information to screen readers.
+  const FB_ORDER = ["DTC","T","P","U","M","B"];
+  const FB_ICON  = { DTC:"engine", T:"temp", P:"gauge", U:"wheel", M:"wrench", B:"battery" };
+  const FB_NAME  = { DTC:"Engine faults", T:"Temperature", P:"Pressure", U:"Usage", M:"Maintenance", B:"Battery" };
+  const FB_COL   = v => v==null ? null : v>=75 ? "#B42318" : v>=60 ? "#D85A30" : v>=40 ? "#BA7517" : null;
+  function factorBars(r){
+    const t=r.terms||{};
+    return '<span class="vh-fbars" aria-hidden="true">'+FB_ORDER.map(k=>{
+      const v=t[k], hot=v!=null && v>=40, col=FB_COL(v);
+      const h = v==null ? 0 : (hot ? Math.max(22,Math.min(100,Math.round(v))) : Math.max(14,Math.round(v)));
+      const sty = hot ? ' style="color:'+col+'"' : '';
+      const title = FB_NAME[k] + (v==null ? " \u2014 not reported" : hot ? " \u2014 elevated ("+Math.round(v)+"/100)" : " \u2014 normal");
+      return '<span class="vh-fbar'+(hot?"":" q")+'"'+sty+' title="'+esc(title)+'">'
+        +'<span class="vh-fbar-t"><i style="height:'+h+'%"></i></span>'
+        +'<span class="vh-fbar-ic">'+svg(FB_ICON[k],12)+'</span></span>';
+    }).join("")+'</span>';
+  }
+  function factorLegend(){
+    return '<div class="vh-fbleg" aria-hidden="true"><span class="vh-fbleg-h">Risk factors</span>'
+      + FB_ORDER.map(k=>'<span class="vh-fbleg-i">'+svg(FB_ICON[k],13)+esc(FB_NAME[k])+'</span>').join("")
+      + '</div>';
+  }
+
   function rowHTML(r,a){
     const dev=r.deviceFaultCount?' <span class="vh-tag" title="Telematics device fault recorded \u2014 excluded from score">device</span>':'';
     const grp=r.groupNames.length?'<span class="vh-rowgrp">'+esc(r.groupNames[0])+(r.groupNames.length>1?' +'+(r.groupNames.length-1):'')+'</span>':'';
     const subt=vehicleSubtitle(r);
     const sub=subt?'<span class="vh-rowsub">'+esc(subt)+'</span>':'';
+    const csel = COMPARE_MODE && COMPARE_SET.indexOf(r.id)>-1;
+    const cmpCls = (COMPARE_MODE?" cmp":"")+(csel?" sel":"");
     const head='<span class="vh-dot" style="background:'+HUE[a.cls]+'" aria-hidden="true"></span>'
       +'<span class="vh-rowname"><span class="vh-rowtop"><span class="vh-nm">'+esc(r.name)+'</span>'+dev+grp+'</span>'+sub+'</span>';
     if(TAB==="breakdown"){
       const mid = r.noData ? '<span class="vh-chip chip-none">'+esc(r.noDataReason||"No data")+'</span>'
         : ((contribHTML(r)+behaviorChip(r)) || '<span class="vh-chip chip-none">No active issues</span>');
-      const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+", risk score "+(r.score==null?"no data":Math.round(r.score)+" of 100")+". Activate for details.");
-      return '<div class="vh-row bd'+(r.noData?" nodata":"")+'" role="button" tabindex="0" data-id="'+esc(r.id)+'" aria-label="'+aria+'">'
-        +head+'<span class="vh-contrib">'+mid+'</span>'
+      const bars = r.noData ? '' : factorBars(r);
+      const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+", risk score "+(r.score==null?"no data":Math.round(r.score)+" of 100")+(COMPARE_MODE?(csel?". Selected for compare. Activate to deselect.":". Activate to select for compare."):". Activate for details."));
+      return '<div class="vh-row bd'+(r.noData?" nodata":"")+cmpCls+'" role="button" tabindex="0" data-id="'+esc(r.id)+'"'+(COMPARE_MODE?' aria-pressed="'+(csel?"true":"false")+'"':'')+' aria-label="'+aria+'">'
+        +head+'<span class="vh-contrib">'+mid+bars+'</span>'
         +'<span class="vh-scorecell">'+scoreMini(r.score)+'</span>'
-        +'<span class="vh-chev" aria-hidden="true">'+svg("chevron",15)+'</span></div>';
+        +'<span class="vh-chev" aria-hidden="true">'+svg(csel?"check":"chevron",15)+'</span></div>';
     }
     const finding = r.noData ? (r.noDataReason||"No data") : ((r.em.detail&&r.em.detail.length)?r.em.detail[0]:(r.em.score===0?"No issues detected":"\u2014"));
     const co2=r.co2?fmtInt(r.co2.totalKg):"\u2014";
     const ph=r.co2&&r.co2.perHour!=null?('<span class="vh-ph">~'+r.co2.perHour.toFixed(1)+' kg/hr</span>'):'';
-    const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+". "+finding+". Activate for details.");
-    return '<div class="vh-row em'+(r.noData?" nodata":"")+'" role="button" tabindex="0" data-id="'+esc(r.id)+'" aria-label="'+aria+'">'
+    const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+". "+finding+(COMPARE_MODE?(csel?". Selected for compare.":". Activate to select for compare."):". Activate for details."));
+    return '<div class="vh-row em'+(r.noData?" nodata":"")+cmpCls+'" role="button" tabindex="0" data-id="'+esc(r.id)+'"'+(COMPARE_MODE?' aria-pressed="'+(csel?"true":"false")+'"':'')+' aria-label="'+aria+'">'
       +head+'<span class="vh-finding">'+esc(finding)+'</span>'
       +'<span class="vh-scorecell num">'+co2+ph+'</span>'
       +'<span class="vh-chev" aria-hidden="true">'+svg("chevron",15)+'</span></div>';
@@ -928,7 +1194,7 @@ geotab.addin.vehicleHealth = () => {
       ? '<div class="vh-colhead bd"><span></span><span>Vehicle</span><span>Top risk factors</span><span class="ralign">Risk score <span class="vh-colhint">lower = healthier</span></span><span></span></div>'
       : '<div class="vh-colhead em"><span></span><span>Vehicle</span><span>Finding</span><span class="ralign">CO\u2082 (kg)</span><span></span></div>';
 
-    let html=colhead;
+    let html=(TAB==="breakdown"?factorLegend():"")+colhead;
     order.forEach(a=>{ const list=byAction[a.id]; if(!list||!list.length)return;
       sortWithin(list);
       const key=TAB+":"+a.id, collapsed=isCollapsed(a.id), limit=SECTION_LIMIT[key]||CONFIG.sectionPreviewRows;
@@ -953,15 +1219,16 @@ geotab.addin.vehicleHealth = () => {
     wrap.querySelectorAll("[data-more]").forEach(b=>b.addEventListener("click",()=>{ const id=b.getAttribute("data-more"), key=TAB+":"+id;
       SECTION_LIMIT[key]=(SECTION_LIMIT[key]||CONFIG.sectionPreviewRows)+CONFIG.sectionPreviewRows; renderList(); }));
     wrap.querySelectorAll(".vh-row").forEach(rw=>{
-      rw.addEventListener("click",()=>openDrawer(rw.getAttribute("data-id"),rw));
-      rw.addEventListener("keydown",e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openDrawer(rw.getAttribute("data-id"),rw); } });
+      const act=()=>{ const id=rw.getAttribute("data-id"); if(COMPARE_MODE) toggleCompare(id); else openDrawer(id,rw); };
+      rw.addEventListener("click",act);
+      rw.addEventListener("keydown",e=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); act(); } });
     });
   }
 
   // ========================= rendering: group rollup =========================
   function groupRollup(){
     const map={};
-    COMPUTED.forEach(r=>{ const names=r.groupNames.length?r.groupNames:["(No group)"]; const need=NEED.has(dispOf(r));
+    filteredRows().forEach(r=>{ const names=r.groupNames.length?r.groupNames:["(No group)"]; const need=NEED.has(dispOf(r));
       names.forEach(n=>{ const g=map[n]||(map[n]={name:n,total:0,need:0}); g.total++; if(need)g.need++; }); });
     return Object.keys(map).map(k=>map[k]).sort((a,b)=> (b.need-a.need)||(b.total-a.total)||(a.name<b.name?-1:1));
   }
@@ -970,6 +1237,7 @@ geotab.addin.vehicleHealth = () => {
     if(LOADING){ showLoading(); return; }
     if(!COMPUTED.length){ wrap.innerHTML=stateBox("dash",SWATCH.x,"No vehicles to show","Adjust the group filter, then Refresh."); return; }
     const rolls=groupRollup();
+    if(!rolls.length){ wrap.innerHTML=stateBox("search",SWATCH.c,"No matches","No vehicles match this filter or search."); return; }
     const head='<div class="vh-colhead grp"><span>Group</span><span class="ralign">Need attention</span><span class="ralign">Vehicles</span><span></span></div>';
     const body=rolls.map(g=>{ const pct=g.total?Math.round(g.need/g.total*100):0; const cls=g.need===0?"g":(pct>=30?"r":"a");
       const aria=esc(g.name+": "+g.need+" of "+g.total+" vehicles need attention. Activate to view in list.");
@@ -1030,8 +1298,110 @@ geotab.addin.vehicleHealth = () => {
       +note+'</div>';
   }
 
+  // Operating-range indicator: a healthy/warning/critical track (from the configured normal/critical thresholds,
+  // not an OEM datasheet) with a marker at the live reading. dir="high" => higher is worse; dir="low" => lower is worse.
+  function rangeBar(value, cfg){
+    const dir=cfg.dir, nrm=cfg.normal, crit=cfg.critical, band=Math.abs(nrm-crit)||1;
+    const G="#5FBF7A", Y="#EBBF49", R="#E0533A"; let lo, hi, grad;
+    if(dir==="high"){ lo=nrm-band; hi=crit+band;
+      const a=(nrm-lo)/(hi-lo)*100, b=(crit-lo)/(hi-lo)*100;
+      grad="linear-gradient(90deg,"+G+" 0%,"+G+" "+a+"%,"+Y+" "+a+"%,"+Y+" "+b+"%,"+R+" "+b+"%,"+R+" 100%)";
+    } else { lo=crit-band; if(lo<0)lo=0; hi=nrm+band;
+      const a=(crit-lo)/(hi-lo)*100, b=(nrm-lo)/(hi-lo)*100;
+      grad="linear-gradient(90deg,"+R+" 0%,"+R+" "+a+"%,"+Y+" "+a+"%,"+Y+" "+b+"%,"+G+" "+b+"%,"+G+" 100%)";
+    }
+    const pos=clamp((value-lo)/(hi-lo),0,1)*100;
+    return '<span class="vh-rng"><span class="vh-rng-bar" style="background:'+grad+'"></span><span class="vh-rng-mark" style="left:'+pos+'%"></span></span>';
+  }
+  function readingRow(label, raw, cfg, display){
+    const sev=signalBadness(raw,cfg.normal,cfg.critical,cfg.dir);
+    const col = sev==null?"#475467" : sev>=100?"#B42318" : sev>=60?"#B54708" : sev>0?"#854A0E" : "#067647";
+    return '<div class="vh-rdg"><div class="vh-rdg-top"><span class="vh-rdg-lab">'+esc(label)+'</span>'
+      +'<span class="vh-rdg-val" style="color:'+col+'">'+esc(display)+'</span></div>'+rangeBar(raw,cfg)+'</div>';
+  }
+  function liveReadings(r){
+    const s=r.sig||{}, out=[];
+    if(s.coolant!=null) out.push(readingRow("Coolant temp", s.coolant, CONFIG.signals.coolant, cToF(s.coolant)+"\u00b0F"));
+    if(s.oilPressure!=null) out.push(readingRow("Oil pressure", s.oilPressure, CONFIG.signals.oilPressure, kpaToPsi(s.oilPressure)+" psi"));
+    if(s.deviceVoltage!=null) out.push(readingRow("Battery voltage", s.deviceVoltage, CONFIG.signals.deviceVoltage, (Math.round(s.deviceVoltage*10)/10).toFixed(1)+" V"));
+    if(!out.length) return "";
+    return '<div class="vh-dsub">Live readings <span class="vh-rng-key">healthy<i class="k g"></i> warning<i class="k y"></i> critical<i class="k r"></i></span></div><div class="vh-rdgs">'+out.join("")+'</div>';
+  }
+  // Advisory drivability call from fault severity + critical live readings. NOT a safety certification - it leans on
+  // the same signals the disposition uses, plus over-temp / loss-of-oil-pressure / DEF-derate, and is shown with a caveat.
+  function drivability(r){
+    if(r.noData) return {key:"unknown", label:"No data", tone:"none"};
+    const s=r.sig||{};
+    const overTemp = s.coolant!=null && signalBadness(s.coolant,CONFIG.signals.coolant.normal,CONFIG.signals.coolant.critical,"high")>=100;
+    const lowOil   = s.oilPressure!=null && signalBadness(s.oilPressure,CONFIG.signals.oilPressure.normal,CONFIG.signals.oilPressure.critical,"low")>=100;
+    const defDerate= r.em && r.em.kind==="diesel" && s.defLevel!=null && s.defLevel<=CONFIG.signals.defLevel.critical;
+    if(r.disp==="Remove from service" || overTemp || lowOil || defDerate){
+      const why = overTemp?"engine over-temperature":lowOil?"loss of oil pressure":defDerate?"DEF critically low (derate likely)":"a critical active fault";
+      return {key:"tow", label:"Do not drive \u2014 tow", tone:"attention", why};
+    }
+    if(r.disp==="Service now") return {key:"soon", label:"Driveable \u2014 service promptly", tone:"recheck"};
+    return {key:"ok", label:"OK to operate", tone:"ok"};
+  }
+  function drivabilityBanner(r){
+    const d=drivability(r); if(d.key==="unknown")return "";
+    const fg={attention:"#B42318",recheck:"#B54708",ok:"#067647"}, bg={attention:"#FEE4E2",recheck:"#FEF0C7",ok:"#ECFDF3"};
+    const ic={attention:"alert",recheck:"wrench",ok:"check"};
+    const why=d.why?' <span class="vh-muted">\u2014 '+esc(d.why)+'</span>':'';
+    return '<div class="vh-drive" style="background:'+bg[d.tone]+';border-color:'+fg[d.tone]+'">'
+      +'<span class="vh-drive-ic" style="color:'+fg[d.tone]+'">'+svg(ic[d.tone],16)+'</span>'
+      +'<span class="vh-drive-tx"><b style="color:'+fg[d.tone]+'">'+esc(d.label)+'</b>'+why
+      +'<span class="vh-drive-note">Advisory only, from reported fault severity and live readings \u2014 not a safety certification. Confirm with a qualified technician.</span></span></div>';
+  }
+
+  // Auto-detected vehicle attributes (no manual tagging). Equipment is asserted only from a reported signal -
+  // an absent signal means "not reported", not "not equipped". On-board class is shown raw (mapping unverified).
+  function profileSection(r){
+    const s=r.sig||{}, det=VIN_CACHE[r.vin]||{}, items=[];
+    if(r.em && (r.em.kind==="gas"||r.em.kind==="diesel")) items.push(["Fuel", r.em.kind==="diesel"?"Diesel":"Gas", ""]);
+    if(det.body) items.push(["Body class", det.body, ""]);
+    if(s.gcvw!=null){ const kg=Math.round(s.gcvw); items.push(["Combination weight", kg.toLocaleString()+" kg ("+Math.round(kg*2.20462).toLocaleString()+" lb)", "Reported gross combination weight"]); }
+    if(s.vehClass!=null) items.push(["On-board class code", String(Math.round(s.vehClass)), "Raw on-board value \u2014 mapping to light/medium/heavy/bus pending verification"]);
+    const eq=[]; if(s.ptoEngaged!=null)eq.push("PTO"); if(s.absEquipped!=null)eq.push("ABS"); if(s.adasEquipped!=null)eq.push("ADAS"); if(s.tpmsEquipped!=null)eq.push("TPMS");
+    if(!items.length && !eq.length) return "";
+    const rows=items.map(it=>'<div class="vh-prow"'+(it[2]?' title="'+esc(it[2])+'"':'')+'><span class="vh-plab">'+esc(it[0])+'</span><span class="vh-pval">'+esc(it[1])+'</span></div>').join("");
+    const eqHTML=eq.length?'<div class="vh-prow"><span class="vh-plab">Equipment</span><span class="vh-pval">'+eq.map(e=>'<span class="vh-eqchip">'+esc(e)+'</span>').join("")+'</span></div>':'';
+    return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Vehicle profile</h4><div class="vh-dsec-meta vh-muted">auto-detected</div></div>'
+      +'<div class="vh-prows">'+rows+eqHTML+'</div></section>';
+  }
+
+  // Peer benchmarking: compare a vehicle against the median of its fuel-type peers (fallback: whole fleet) to
+  // surface "running hotter / weaker / dirtier than the pack". Differences within +/-10% of median read as typical.
+  function median(arr){ if(!arr.length)return null; const a=arr.slice().sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
+  function benchRow(label, valTxt, medTxt, val, med, higherWorse){
+    const denom=Math.abs(med)>1e-9?Math.abs(med):1, rel=(val-med)/denom; let arrow="\u2248", word="typical", tone="typical";
+    if(rel>0.1){ arrow="\u2191"; word="above median"; tone=higherWorse?"bad":"good"; }
+    else if(rel<-0.1){ arrow="\u2193"; word="below median"; tone=higherWorse?"good":"bad"; }
+    const c={bad:"#B42318",good:"#067647",typical:"#475467"}[tone];
+    return '<div class="vh-brow"><span class="vh-blab">'+esc(label)+'</span><span class="vh-bval">'+esc(valTxt)+'</span>'
+      +'<span class="vh-bmed">median '+esc(medTxt)+'</span><span class="vh-bind" style="color:'+c+'">'+arrow+' '+word+'</span></div>';
+  }
+  function benchmarkSection(r){
+    if(r.noData) return "";
+    const kind=r.em&&r.em.kind;
+    let peers=COMPUTED.filter(x=>!x.noData && x.em && x.em.kind===kind), scope=kind==="diesel"?"diesel vehicles":kind==="gas"?"gas vehicles":"vehicles";
+    if(peers.length<5){ peers=COMPUTED.filter(x=>!x.noData); scope="vehicles"; }
+    if(peers.length<3) return "";
+    const s=r.sig||{}, rows=[], col=fn=>peers.map(fn).filter(v=>v!=null);
+    const add=(label,val,vals,fmt,hw)=>{ if(val==null)return; const med=median(vals.filter(v=>v!=null)); if(med==null)return; rows.push(benchRow(label,fmt(val),fmt(med),val,med,hw)); };
+    add("Risk score", r.score, col(x=>x.score), v=>String(Math.round(v)), true);
+    if(s.coolant!=null) add("Coolant temp", s.coolant, col(x=>x.sig&&x.sig.coolant), v=>cToF(v)+"\u00b0F", true);
+    if(s.oilPressure!=null) add("Oil pressure", s.oilPressure, col(x=>x.sig&&x.sig.oilPressure), v=>kpaToPsi(v)+" psi", false);
+    if(s.deviceVoltage!=null) add("Battery voltage", s.deviceVoltage, col(x=>x.sig&&x.sig.deviceVoltage), v=>(Math.round(v*10)/10).toFixed(1)+" V", false);
+    if(kind==="diesel" && s.defLevel!=null) add("DEF level", s.defLevel, col(x=>x.sig&&x.sig.defLevel), v=>Math.round(v)+"%", false);
+    if(r.co2&&r.co2.perHour!=null) add("CO\u2082 / engine-hr", r.co2.perHour, col(x=>x.co2&&x.co2.perHour), v=>v.toFixed(1)+" kg", true);
+    if(r.harsh!=null) add("Harsh events", r.harsh, col(x=>x.harsh!=null?x.harsh:null), v=>String(Math.round(v)), true);
+    if(!rows.length) return "";
+    return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>How this compares</h4><div class="vh-dsec-meta vh-muted">vs '+peers.length+' '+esc(scope)+'</div></div>'
+      +'<div class="vh-bench">'+rows.join("")+'</div></section>';
+  }
+
   function breakdownSection(r){
-    const w=CONFIG.weights;
+    const w=(SETTINGS&&SETTINGS.weights)||CONFIG.weights;
     const factors='<div class="vh-terms">'
       +termRow("Faults \u00b7 "+(w.DTC*100)+"%","DTC",r.terms)+termRow("Temp \u00b7 "+(w.T*100)+"%","T",r.terms)
       +termRow("Pressure \u00b7 "+(w.P*100)+"%","P",r.terms)+termRow("Usage \u00b7 "+(w.U*100)+"%","U",r.terms)
@@ -1055,6 +1425,7 @@ geotab.addin.vehicleHealth = () => {
       +riskGauge(r)
       +gr
       +'<div class="vh-dsub">Top risk factors (weight)</div>'+factors
+      +liveReadings(r)
       +'<div class="vh-dsub">Diagnostic faults</div>'+faults
       +(ns?'<div class="vh-dsub">Notes</div>'+ns:'')+'</section>';
   }
@@ -1064,27 +1435,21 @@ geotab.addin.vehicleHealth = () => {
     const bg={ok:"#ECFDF3",recheck:"#FEF0C7",attention:"#FEE4E2",none:"#F2F4F7"};
     const hpill='<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;background:'+(bg[state]||bg.none)+';color:'+(fg[state]||fg.none)+'">'+esc(em.disp||"No data")+'</span>';
     const head=em.headline?'<div class="vh-callout" style="border-left:3px solid '+(fg[state]||fg.none)+';margin-bottom:12px">'+esc(em.headline)+'</div>':'';
-    let rows=(em.rows||[]).slice();
-    if(kind==="gas"){
-      const catFault=(r.items||[]).some(i=>/catalyst.*efficiency below threshold/i.test(i.name||""));
-      const catMon=rows.find(x=>/catalyst monitor/i.test(x.label||""));
-      let cv,cs;
-      if(catFault){ cv="efficiency fault (P0420/P0430)"; cs="attention"; }
-      else if(catMon && /not complete/i.test(catMon.value)){ cv="monitor not yet complete"; cs="recheck"; }
-      else { cv="no efficiency fault detected"; cs="ok"; }
-      rows.push({label:"Catalytic converter",value:cv,state:cs});
-    }
+    const rows=(em.rows||[]).slice();
     const dot=st=>'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+(fg[st]||"#98A2B3")+';margin-right:8px;vertical-align:middle"></span>';
     const strip=rows.length
       ? '<div style="margin-top:4px">'+rows.map(x=>'<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #F2F4F7"><span style="color:#344054">'+dot(x.state)+esc(x.label)+'</span><span style="color:#475467;font-weight:500">'+esc(x.value)+'</span></div>').join("")+'</div>'
       : '<p class="vh-muted">No emissions signals reported.</p>';
+    const defBar = (kind==="diesel" && r.sig && r.sig.defLevel!=null)
+      ? '<div class="vh-rdg" style="margin-top:10px"><div class="vh-rdg-top"><span class="vh-rdg-lab">DEF level</span><span class="vh-rdg-val">'+Math.round(r.sig.defLevel)+'%</span></div>'+rangeBar(r.sig.defLevel,CONFIG.signals.defLevel)+'</div>'
+      : '';
     let carbon='';
     if(r.co2){ const ph=r.co2.perHour!=null?('<br><b>~'+r.co2.perHour.toFixed(1)+' kg CO\u2082 / engine-hour</b> (last '+r.co2.perHourDays+' days)'):'';
       carbon='<div class="vh-callout"><b>'+fmtInt(r.co2.totalKg)+' kg</b> total \u00b7 <b>'+fmtInt(r.co2.idleKg)+' kg</b> from idling'+(r.co2.idleWaste?' \u26a0 high idle waste':'')+ph
         +'<br><span class="vh-muted">Fuel-derived estimate \u2014 use the Geotab Sustainability Center for certified figures.</span></div>'; }
     return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Emissions health</h4><div class="vh-dsec-meta">'+hpill+'</div></div>'
       +head
-      +'<div class="vh-dsub">Status</div>'+strip
+      +'<div class="vh-dsub">Status</div>'+strip+defBar
       +(carbon?'<div class="vh-dsub">Carbon estimate</div>'+carbon:'')+'</section>';
   }
 
@@ -1102,7 +1467,7 @@ geotab.addin.vehicleHealth = () => {
     const sub=(grp?'<span class="vh-dgrp">'+grp+'</span>':'')+idline+detline+seenline;
     return '<div class="vh-dhead"><div class="vh-dhead-row"><div><h3 id="vh-dtitle">'+esc(r.name)+'</h3>'+sub+'</div>'
       +'<button class="vh-x" id="vh-dx" aria-label="Close details">'+svg("close",16)+'</button></div></div>'
-      +'<div class="vh-dbody">'+breakdownSection(r)+emissionsSection(r)+'</div>';
+      +'<div class="vh-dbody">'+drivabilityBanner(r)+profileSection(r)+breakdownSection(r)+benchmarkSection(r)+emissionsSection(r)+'</div>';
   }
   function refreshDrawerBody(r){ const d=el("vh-drawer"); if(!d)return; d.innerHTML=drawerHTML(r); const dx=el("vh-dx"); if(dx)dx.addEventListener("click",closeDrawer); }
   function openDrawer(id,fromEl){
@@ -1129,33 +1494,64 @@ geotab.addin.vehicleHealth = () => {
   function setTab(t){ if(TAB===t)return; TAB=t; FILTER=null; FILTER_ID="all"; SECTION_LIMIT={}; closeDrawer(); renderAll();
     announce(TAB==="breakdown"?"Breakdown risk view":"Emissions health view"); }
   function setFilter(id,set){ FILTER_ID=id; FILTER=set; SECTION_LIMIT={}; renderAll(); announce("Showing "+filteredRows().length+" vehicles"); }
-  function setView(v){ if(VIEW===v)return; VIEW=v; SECTION_LIMIT={}; renderAll(); }
+  function setView(v){ if(VIEW===v)return; if(v==="group" && COMPARE_MODE){ setCompareMode(false); } VIEW=v; SECTION_LIMIT={}; renderAll(); }
   function setSearch(q){ SEARCH=q; SECTION_LIMIT={}; renderAll(); }
   function toggleSection(id){ const key=TAB+":"+id; COLLAPSED[key]=!isCollapsed(id); renderAll(); }
 
+  // One comprehensive report (breakdown + emissions + readings + reason + drivability), reflecting the current
+  // filters/search. Plain-English columns so a row tells you what's wrong, how urgent, whether to drive it, and why.
+  function reasonText(r){
+    if(r.noData) return r.noDataReason||"No data";
+    const dr=escalationDriver(r); if(dr) return dr.charAt(0).toUpperCase()+dr.slice(1);
+    const wf=worstFault(r); if(wf) return wf.name+(wf.domState?" ("+String(wf.domState).toLowerCase()+")":"");
+    const tc=topContributors(r.terms)[0];
+    if(tc){ const rd=readingText(tc.k, r.detail&&r.detail[tc.k]); return factorLabel(r,tc.k)+(rd?" \u2014 "+rd:""); }
+    return "No active issues";
+  }
+  function bandLabelOf(score){ const k=bandKeyOf(score); const f=BAND_FACET.find(b=>b[0]===k); return f?f[1]:""; }
+  function equipText(s){ const e=[]; if(s){ if(s.ptoEngaged!=null)e.push("PTO"); if(s.absEquipped!=null)e.push("ABS"); if(s.adasEquipped!=null)e.push("ADAS"); if(s.tpmsEquipped!=null)e.push("TPMS"); } return e.join(" "); }
   function exportCSV(){
     const rows=filteredRows(); if(!rows.length)return;
     const order=actionsFor().map(a=>a.id);
     rows.sort((a,b)=>{ const ia=order.indexOf(dispOf(a)),ib=order.indexOf(dispOf(b)); if(ia!==ib)return ia-ib;
       const sa=scoreOf(a),sb=scoreOf(b); return (sb==null?-1:sb)-(sa==null?-1:sa); });
     const q=s=>'"'+String(s==null?"":s).replace(/"/g,'""')+'"';
-    const idCols=r=>[r.vin||"",r.year||"",r.make||"",r.model||"",r.plate||"",r.distanceMi!=null?Math.round(r.distanceMi):"",r.lastComm?new Date(r.lastComm).toISOString():""];
-    const idHead=["VIN","Year","Make","Model","Plate","Miles (window)","Last reported"];
-    let head,line;
-    if(TAB==="breakdown"){
-      head=["Vehicle","Group"].concat(idHead,["Recommended action","Risk score","Geotab risk %","Faults","Temp","Pressure","Usage","Maint","Battery","Device faults"]);
-      line=r=>[r.name,r.groupNames.join(" | ")].concat(idCols(r),[r.disp,r.score==null?"":Math.round(r.score),r.geotabRisk==null?"":Math.round(r.geotabRisk),
-        r.terms.DTC==null?"":Math.round(r.terms.DTC),r.terms.T==null?"":Math.round(r.terms.T),r.terms.P==null?"":Math.round(r.terms.P),
-        r.terms.U==null?"":Math.round(r.terms.U),r.terms.M==null?"":Math.round(r.terms.M),r.terms.B==null?"":Math.round(r.terms.B),r.deviceFaultCount]);
-    } else {
-      head=["Vehicle","Group"].concat(idHead,["Emissions action","Emissions score","CO2 total kg","CO2 idle kg","CO2 per engine-hour","Findings"]);
-      line=r=>[r.name,r.groupNames.join(" | ")].concat(idCols(r),[r.em.disp,r.em.score==null?"":Math.round(r.em.score),
-        r.co2?Math.round(r.co2.totalKg):"",r.co2?Math.round(r.co2.idleKg):"",r.co2&&r.co2.perHour!=null?r.co2.perHour.toFixed(2):"",(r.em.detail||[]).join("; ")]);
-    }
-    const csv=[head.map(q).join(",")].concat(rows.map(r=>line(r).map(q).join(","))).join("\r\n");
+    const head=["Vehicle","Group(s)","Year","Make","Model","VIN","Plate","Fuel","Body class","Equipment",
+      "Recommended action","Drivability","Primary reason",
+      "Risk score","Risk band","Geotab predicted risk %",
+      "Worst fault","Active faults","Pending faults",
+      "Faults score","Temp score","Pressure score","Usage score","Maint score","Battery score",
+      "Coolant F","Oil pressure psi","Battery V","DEF %",
+      "Open DVIR defects","Harsh events",
+      "Emissions status","Emissions finding","CO2 total kg","CO2 idle kg","CO2 per engine-hr",
+      "Miles (window)","Last reported","Data status"];
+    const line=r=>{
+      const s=r.sig||{}, det=VIN_CACHE[r.vin]||{}, dr=drivability(r);
+      const items=r.items||[], act=items.filter(i=>i.domState==="Active").length, pend=items.filter(i=>i.domState==="Pending").length;
+      const wf=worstFault(r);
+      const dataStatus = r.noData ? (r.noDataReason||"No data") : "OK";
+      return [r.name, r.groupNames.join(" | "), r.year||"", r.make||"", r.model||"", r.vin||"", r.plate||"",
+        r.em&&(r.em.kind==="gas"||r.em.kind==="diesel")?(r.em.kind==="diesel"?"Diesel":"Gas"):"", det.body||"", equipText(s),
+        r.disp, dr.label.replace(/\u2014/g,"-"), reasonText(r),
+        r.score==null?"":Math.round(r.score), bandLabelOf(r.score), r.geotabRisk==null?"":Math.round(r.geotabRisk),
+        wf?wf.name+(wf.domState?" ("+String(wf.domState).toLowerCase()+")":""):"", act, pend,
+        r.terms.DTC==null?"":Math.round(r.terms.DTC), r.terms.T==null?"":Math.round(r.terms.T), r.terms.P==null?"":Math.round(r.terms.P),
+        r.terms.U==null?"":Math.round(r.terms.U), r.terms.M==null?"":Math.round(r.terms.M), r.terms.B==null?"":Math.round(r.terms.B),
+        s.coolant!=null?cToF(s.coolant):"", s.oilPressure!=null?kpaToPsi(s.oilPressure):"", s.deviceVoltage!=null?(Math.round(s.deviceVoltage*10)/10).toFixed(1):"", s.defLevel!=null?Math.round(s.defLevel):"",
+        r.openDefects||0, r.harsh||0,
+        r.em?r.em.disp:"", (r.em&&r.em.detail||[]).join("; "), r.co2?Math.round(r.co2.totalKg):"", r.co2?Math.round(r.co2.idleKg):"", r.co2&&r.co2.perHour!=null?r.co2.perHour.toFixed(2):"",
+        r.distanceMi!=null?Math.round(r.distanceMi):"", r.lastComm?new Date(r.lastComm).toISOString():"", dataStatus];
+    };
+    const need=rows.filter(r=>NEED.has(dispOf(r))).length;
+    const filt=[]; if(SEARCH)filt.push('search="'+SEARCH+'"'); if(FILTER_ID&&FILTER_ID!=="all")filt.push("status="+FILTER_ID); if(anyFacetActive())filt.push(activeFacetChips()+" facet filter(s)");
+    const meta=[["Lytx Vehicle Health report"],["Generated", new Date().toISOString()],["Window", WINDOW_DAYS+" days"],
+      ["Scope", filt.length?filt.join("; "):"all loaded vehicles"],["Vehicles in report", rows.length],["Needing attention", need],[]];
+    const body=[head.map(q).join(",")].concat(rows.map(r=>line(r).map(q).join(",")));
+    const csv=meta.map(m=>m.map(q).join(",")).concat(body).join("\r\n");
     const blob=new Blob(["\ufeff"+csv],{type:"text/csv;charset=utf-8;"});
     const url=URL.createObjectURL(blob), a=document.createElement("a");
-    a.href=url; a.download="vehicle-health-"+TAB+".csv"; document.body.appendChild(a); a.click(); a.remove();
+    const d=new Date(), ymd=d.getFullYear()+String(d.getMonth()+1).padStart(2,"0")+String(d.getDate()).padStart(2,"0");
+    a.href=url; a.download="lytx-vehicle-health-report-"+ymd+".csv"; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(url),1500);
   }
 
@@ -1183,6 +1579,12 @@ geotab.addin.vehicleHealth = () => {
       + '<input type="number" inputmode="decimal" data-num="'+kind+'" data-which="'+which+'" value="'+val+'" step="'+step+'" min="0"'+(ro?" disabled":"")+' />'
       + (unit?'<span class="unit">'+esc(unit)+'</span>':'') + '</span></div>';
   }
+  function weightField(k,label,val){
+    const ro=!CAN_EDIT_SETTINGS;
+    return '<div class="vh-numf"><label>'+esc(label)+'</label><span class="row">'
+      + '<input type="number" inputmode="numeric" data-weight="'+k+'" value="'+Math.round(val*100)+'" step="5" min="0" max="100"'+(ro?" disabled":"")+' />'
+      + '<span class="unit">%</span></span></div>';
+  }
   function renderSettings(){
     const md=el("vh-settings"); if(!md||!SET_FORM)return;
     const ro=!CAN_EDIT_SETTINGS;
@@ -1190,6 +1592,7 @@ geotab.addin.vehicleHealth = () => {
     const harshN=SET_FORM.harsh.normal, harshC=SET_FORM.harsh.critical;
     const idleN=pct(SET_FORM.idle.normal), idleC=pct(SET_FORM.idle.critical);
     const stale=SET_FORM.staleHours;
+    const w=SET_FORM.weights||defaultSettings().weights;
     md.innerHTML =
       '<div class="vh-mhead"><div><h3 id="vh-set-title">Settings</h3>'
         +'<p>Tune how sensitive scoring is to driving behavior and data freshness. Shared across your organization.</p></div>'
@@ -1209,6 +1612,16 @@ geotab.addin.vehicleHealth = () => {
           +'<div class="vh-fset"><div class="vh-fset-h">Data freshness</div>'
             +'<div class="vh-fset-d">Flag a vehicle as offline when it hasn\u2019t reported for longer than this.</div>'
             +'<div class="vh-nums">'+numField("stale","stale","Offline after","hours",stale,"1")+'</div></div>'
+          +'<div class="vh-fset"><div class="vh-fset-h">Score weights</div>'
+            +'<div class="vh-fset-d">Relative importance of each risk factor in the breakdown score. They don\u2019t need to add up to 100 \u2014 the score is normalized across whichever factors a vehicle reports.</div>'
+            +'<div class="vh-nums">'
+              + weightField("DTC","Engine faults", w.DTC)
+              + weightField("T","Temperature", w.T)
+              + weightField("P","Pressure", w.P)
+              + weightField("U","Usage", w.U)
+              + weightField("M","Maintenance", w.M)
+              + weightField("B","Battery", w.B)
+            +'</div></div>'
         +'</div></div>'
       +'<div class="vh-mfoot">'
         +'<button class="vh-btn vh-btn-ghost vh-set-reset" type="button"'+(ro?" disabled":"")+'>Reset to defaults</button>'
@@ -1235,6 +1648,12 @@ geotab.addin.vehicleHealth = () => {
       if(kind==="stale"){ SET_FORM.staleHours=v; }
       else if(kind==="idle"){ SET_FORM.idle[which]=clamp(v/100,0,1); refreshPresetHighlight("idle"); }
       else { SET_FORM.harsh[which]=v; refreshPresetHighlight("harsh"); }
+    }));
+    md.querySelectorAll("[data-weight]").forEach(inp=>inp.addEventListener("input",()=>{
+      const k=inp.getAttribute("data-weight"); const v=Number(inp.value);
+      if(!isFinite(v))return;
+      if(!SET_FORM.weights)SET_FORM.weights=Object.assign({},CONFIG.weights);
+      SET_FORM.weights[k]=clamp(v/100,0,1);
     }));
     const rs=md.querySelector(".vh-set-reset"); if(rs)rs.addEventListener("click",()=>{ SET_FORM=defaultSettings(); renderSettings(); });
     const sv=md.querySelector(".vh-set-save"); if(sv)sv.addEventListener("click",onSaveSettings);
@@ -1272,13 +1691,17 @@ geotab.addin.vehicleHealth = () => {
       try{ loadState(); }catch(e){}
       const on=(id,ev,fn)=>{ const e=el(id); if(e)e.addEventListener(ev,fn); };
       const w=el("vh-window"); if(w)w.value=String(WINDOW_DAYS);
-      on("vh-refresh","click",run);
+      on("vh-refresh","click",()=>{ clearDiagCatalog(); run(); });
       on("vh-window","change",()=>{ const w2=el("vh-window"); WINDOW_DAYS=Number(w2&&w2.value)||WINDOW_DAYS; run(); });
       on("vh-tab-bd","click",()=>setTab("breakdown"));
       on("vh-tab-em","click",()=>setTab("emissions"));
       on("vh-view-list","click",()=>setView("list"));
       on("vh-view-group","click",()=>setView("group"));
       on("vh-export","click",exportCSV);
+      on("vh-filters-btn","click",toggleFiltersPanel);
+      on("vh-compare-btn","click",()=>setCompareMode(!COMPARE_MODE));
+      on("vh-cscrim","click",closeCompare);
+      on("vh-compare","keydown",compareKeydown);
       on("vh-scrim","click",closeDrawer);
       on("vh-settings-btn","click",openSettings);
       on("vh-mscrim","click",closeSettings);
