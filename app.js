@@ -57,6 +57,9 @@ geotab.addin.vehicleHealth = () => {
     rootGroupIds: ["GroupCompanyId"],// excluded from group labels / rollup (every vehicle is in it)
     maxGroups: 5000,
     persistKey: "vh.v4",             // localStorage namespace (per-database key appended at runtime)
+    // Security-group ids allowed to CHANGE shared settings, IN ADDITION to built-in Administrator/Supervisor/Manager
+    // clearances (auto-detected). Add a customer's custom admin clearance id here if their DB uses custom groups.
+    adminGroupIds: [],
   };
 
   // ========================= pure helpers =========================
@@ -137,7 +140,7 @@ geotab.addin.vehicleHealth = () => {
     let idleRatio=null;
     if(ctx.idleSec!=null && ctx.driveSec!=null && (ctx.idleSec+ctx.driveSec)>0) idleRatio=ctx.idleSec/(ctx.idleSec+ctx.driveSec);
     else if(s.fuelTotal!=null && s.fuelIdle!=null && s.fuelTotal>0) idleRatio=s.fuelIdle/s.fuelTotal;
-    const ic=CONFIG.idleRatio, hc=CONFIG.harshRate;
+    const ic=SETTINGS.idle, hc=SETTINGS.harsh;
     const idleBad = idleRatio==null?null:(idleRatio<=ic.normal?0:idleRatio>=ic.critical?100:clamp((idleRatio-ic.normal)/(ic.critical-ic.normal)*100,0,100));
     const harshBad = harshCount==null?null:(harshCount<=hc.normal?0:harshCount>=hc.critical?100:clamp((harshCount-hc.normal)/(hc.critical-hc.normal)*100,0,100));
     const vals=[idleBad,harshBad].filter(v=>v!=null);
@@ -157,6 +160,135 @@ geotab.addin.vehicleHealth = () => {
     const cr=CONFIG.signals.cranking; const crb=signalBadness(s.cranking,cr.normal,cr.critical,cr.dir); if(crb!=null)parts.push(crb);
     if(batteryFaultOcc>0)parts.push(clamp(40+batteryFaultOcc*3,0,100));
     return parts.length?Math.max.apply(null,parts):null;
+  }
+
+  // ========================= configurable settings (stored in Geotab AddInData; shared across the database) =========================
+  // Encoded GUID that isolates THIS add-in's stored data from every other add-in. Generated once - do NOT change it
+  // (changing it orphans previously saved settings). Geotab format: "a" + 22 URL-safe base64 chars.
+  const ADDIN_ID = "amM5ODA0OTgtMzBmZi04Y2E";
+
+  // The only cutoffs a fleet manager can tune. Everything else (scoring weights, score bands, temp/pressure limits)
+  // stays internal so scores stay comparable across fleets. Defaults mirror CONFIG (= the "Medium" presets).
+  function defaultSettings(){ return {
+    v:1,
+    harsh:{ normal:CONFIG.harshRate.normal, critical:CONFIG.harshRate.critical },
+    idle:{ normal:CONFIG.idleRatio.normal, critical:CONFIG.idleRatio.critical },
+    staleHours:CONFIG.staleHours
+  }; }
+  const PRESETS = {
+    harsh: { high:{normal:10,critical:60},   medium:{normal:20,critical:120}, low:{normal:40,critical:200} },
+    idle:  { high:{normal:0.15,critical:0.45}, medium:{normal:0.25,critical:0.60}, low:{normal:0.35,critical:0.75} }
+  };
+  // Which preset (if any) a pair of numbers matches exactly - used to light the right preset button.
+  function presetName(kind,pair){ const P=PRESETS[kind]; for(const n in P){ if(P[n].normal===pair.normal && P[n].critical===pair.critical) return n; } return "custom"; }
+
+  function safeJSON(str){ try{ return JSON.parse(str); }catch(e){ return null; } }
+  function errText(err){ if(!err)return "Save failed."; if(typeof err==="string")return err; return err.message||err.name||"Save failed."; }
+
+  // Validate/repair anything coming back from storage (or a stale schema) so the engine always gets sane numbers.
+  function sanitizeSettings(raw){
+    const d=defaultSettings();
+    if(!raw||typeof raw!=="object") return d;
+    const n=(x,fb)=>{ const v=Number(x); return isFinite(v)?v:fb; };
+    let hn=clamp(Math.round(n(raw.harsh&&raw.harsh.normal,d.harsh.normal)),1,2000);
+    let hc=clamp(Math.round(n(raw.harsh&&raw.harsh.critical,d.harsh.critical)),1,5000); if(hc<=hn)hc=hn+1;
+    let inn=clamp(n(raw.idle&&raw.idle.normal,d.idle.normal),0,0.95);
+    let ic=clamp(n(raw.idle&&raw.idle.critical,d.idle.critical),0,1); if(ic<=inn)ic=Math.min(1,inn+0.01);
+    let sh=clamp(Math.round(n(raw.staleHours,d.staleHours)),1,720);
+    return { v:1, harsh:{normal:hn,critical:hc}, idle:{normal:inn,critical:ic}, staleHours:sh };
+  }
+
+  // A user may CHANGE shared settings only with elevated clearance. Built-in Administrator/Supervisor/Manager
+  // clearances are recognised by their security-group id; custom clearances can be added via CONFIG.adminGroupIds.
+  // Anything else (Default User, View Only, custom) is read-only - fail-safe.
+  const ELEVATED_RE = /(everything|administrator|supervisor|manager|admin)/i;
+  function isElevated(groups){
+    if(!groups||!groups.length) return false;
+    return groups.some(g=>{ const id=g&&g.id; if(!id)return false;
+      return CONFIG.adminGroupIds.indexOf(id)>-1 || ELEVATED_RE.test(id); });
+  }
+  function checkClearance(cb){
+    CAN_EDIT_SETTINGS=false;
+    if(!API||!API.getSession){ return cb&&cb(); }
+    let done=false; const fin=()=>{ if(done)return; done=true; cb&&cb(); };
+    try{
+      API.getSession(function(session){
+        const uname = session && (session.userName || (session.credentials&&session.credentials.userName));
+        if(!uname){ return fin(); }
+        API.call("Get",{typeName:"User",search:{name:uname}}, function(users){
+          try{ const u=users&&users[0]; CAN_EDIT_SETTINGS=isElevated((u&&u.securityGroups)||[]); }catch(e){}
+          fin();
+        }, function(){ fin(); });
+      }, function(){ fin(); });
+    }catch(e){ fin(); }
+  }
+  function loadSettings(cb){
+    if(!API||!API.call){ SETTINGS=defaultSettings(); return cb&&cb(); }
+    try{
+      API.call("Get",{typeName:"AddInData",search:{addInId:ADDIN_ID}}, function(rows){
+        try{
+          if(rows && rows.length){
+            const row=rows[0]; SETTINGS_ID=row.id||null;
+            let det=(row.details!=null)?row.details:row.data;     // 'details' deserialises as an object (preferred over legacy 'data')
+            if(typeof det==="string") det=safeJSON(det);
+            SETTINGS=sanitizeSettings(det);
+          } else { SETTINGS=defaultSettings(); SETTINGS_ID=null; }
+        }catch(e){ SETTINGS=defaultSettings(); }
+        cb&&cb();
+      }, function(){ SETTINGS=defaultSettings(); cb&&cb(); });
+    }catch(e){ SETTINGS=defaultSettings(); cb&&cb(); }
+  }
+  function saveSettings(next, done){
+    next=sanitizeSettings(next);
+    if(!CAN_EDIT_SETTINGS){ return done&&done(false,"You need Administrator or Supervisor access to change these settings."); }
+    if(!API||!API.call){ return done&&done(false,"Storage is not available in this session."); }
+    const ok=()=>{ SETTINGS=next; done&&done(true,""); };
+    try{
+      if(SETTINGS_ID){
+        API.call("Set",{typeName:"AddInData",entity:{id:SETTINGS_ID,addInId:ADDIN_ID,groups:[{id:"GroupCompanyId"}],details:next}},
+          function(){ ok(); }, function(err){ done&&done(false,errText(err)); });
+      } else {
+        API.call("Add",{typeName:"AddInData",entity:{addInId:ADDIN_ID,groups:[{id:"GroupCompanyId"}],details:next}},
+          function(res){ SETTINGS_ID=(res&&res.id)?res.id:(typeof res==="string"?res:SETTINGS_ID); ok(); },
+          function(err){ done&&done(false,errText(err)); });
+      }
+    }catch(e){ done&&done(false,errText(e)); }
+  }
+  // Load clearance + settings exactly once, then drain any waiters. Later calls run the callback immediately.
+  function ensureSettings(cb){
+    if(SETTINGS_LOADED){ return cb&&cb(); }
+    ENS_Q.push(cb);
+    if(SETTINGS_LOADING) return;
+    SETTINGS_LOADING=true;
+    checkClearance(function(){ loadSettings(function(){
+      SETTINGS_LOADED=true; SETTINGS_LOADING=false;
+      const q=ENS_Q.slice(); ENS_Q.length=0; q.forEach(fn=>fn&&fn());
+    }); });
+  }
+
+  // ---- per-row signal detail: the worst live reading behind each factor, for the plain-language row chips ----
+  function cToF(c){ return Math.round(c*9/5+32); }
+  function kpaToPsi(k){ return Math.round(k*0.1450377); }
+  function dominantSignal(s,keys){   // worst (highest-badness) reading among keys, only when it actually contributes
+    let best=null;
+    keys.forEach(k=>{ const sg=CONFIG.signals[k]; const b=signalBadness(s[k],sg.normal,sg.critical,sg.dir);
+      if(b!=null && b>0 && (best==null||b>best.score)) best={score:b,who:k,value:s[k]}; });
+    return best;
+  }
+  function buildDetail(s,openDef,battOcc){
+    const d={ T:null, P:null, B:null, M:null };
+    d.T=dominantSignal(s,["coolant","oilTemp","transTemp"]);
+    d.P=dominantSignal(s,["oilPressure","fuelPressure","boost"]);
+    let b=dominantSignal(s,["deviceVoltage","cranking"]);
+    if(battOcc>0){ const fb=clamp(40+battOcc*3,0,100); if(b==null||fb>b.score) b={score:fb,who:"battFault",value:battOcc}; }
+    d.B=b;
+    let m=null;
+    if(s.milDistance!=null && s.milDistance>0) m={score:60,who:"mil",value:s.milDistance};
+    if(openDef!=null && openDef>0){ const sc=clamp(40+(openDef-1)*30,0,100); if(m==null||sc>m.score) m={score:sc,who:"defects",value:openDef}; }
+    const ol=CONFIG.signals.oilLife; const olb=signalBadness(s.oilLife,ol.normal,ol.critical,ol.dir);
+    if(olb!=null && olb>0 && (m==null||olb>m.score)) m={score:olb,who:"oilLife",value:s.oilLife};
+    d.M=m;
+    return d;
   }
 
   function combine(terms){ let w=0,a=0; for(const k in CONFIG.weights){ const v=terms[k]; if(v==null)continue; w+=CONFIG.weights[k]; a+=CONFIG.weights[k]*v; } return w===0?null:a/w; }
@@ -282,6 +414,7 @@ geotab.addin.vehicleHealth = () => {
     search:'<circle cx="9.5" cy="9.5" r="6"/><line x1="18" y1="18" x2="13.7" y2="13.7"/>',
     close:'<line x1="5" y1="5" x2="17" y2="17"/><line x1="17" y1="5" x2="5" y2="17"/>',
     download:'<path d="M11 3v10"/><polyline points="6.5,9 11,13.5 15.5,9"/><line x1="4" y1="18" x2="18" y2="18"/>',
+    gear:'<circle cx="11" cy="11" r="3"/><path d="M11 1.8v2.4M11 17.8v2.4M2.2 11h2.4M17.4 11h2.4M4.8 4.8l1.7 1.7M15.5 15.5l1.7 1.7M4.8 17.2l1.7-1.7M15.5 6.5l1.7-1.7"/>',
   };
   const svg = (name, sz) => '<svg class="vh-i" width="'+(sz||16)+'" height="'+(sz||16)+'" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'+(ICON[name]||"")+'</svg>';
 
@@ -294,6 +427,13 @@ geotab.addin.vehicleHealth = () => {
   let TRUNC=[];              // names of datasets that hit their result cap (truncated)
   let VIN_CACHE={};          // vin -> { engine, trim, driveline, gvwr, body } from Geotab DecodeVins (cached for the session)
   let CURRENT_DRAWER_ID=null;// vehicle id whose drawer is open (for post-enrichment refresh)
+  // ---- configurable settings (loaded from Geotab AddInData on first focus) ----
+  let SETTINGS=defaultSettings(); // active cutoffs (defaults until loaded)
+  let SETTINGS_ID=null;           // AddInData object id (null until first save; enables in-place updates)
+  let CAN_EDIT_SETTINGS=false;    // true only for elevated clearances (fail-safe default: read-only)
+  let SETTINGS_LOADED=false, SETTINGS_LOADING=false;
+  const ENS_Q=[];                 // callbacks waiting on the one-time settings load
+  let SET_FORM=null;              // working copy of settings while the panel is open
 
   // ========================= persistence (graceful if storage blocked) =========================
   const pKey = () => CONFIG.persistKey + ":" + (DB||"_");
@@ -470,6 +610,7 @@ geotab.addin.vehicleHealth = () => {
             const terms={ DTC:dtc.score, T:tempTerm(s), P:pressureTerm(s), U:up.score, M:maintTerm(s,openDef), B:batteryTerm(s,battOcc) };
             const usageKind = up.score==null?null:((up.harshBad||0)>=(up.idleBad||0)?"harsh":"idle");
             const hasData = b.vehicle.length||b.battery.length||Object.keys(s).length||(harsh&&harsh>0)||(openDef&&openDef>0);
+            const detail = hasData ? buildDetail(s,openDef,battOcc) : null;
             const dFuel=(s.fuelTotal!=null&&f0.fuelTotal!=null)?s.fuelTotal-f0.fuelTotal:null;
             const hk=s.engineHours!=null?"engineHours":(s.engineHoursAdj!=null?"engineHoursAdj":null);
             const dHours=(hk&&f0[hk]!=null)?s[hk]-f0[hk]:null;
@@ -477,7 +618,7 @@ geotab.addin.vehicleHealth = () => {
             const geotabRisk = (s.predictedRisk!=null && !isNaN(s.predictedRisk)) ? s.predictedRisk : null;
             let score,disp,em,co2,noDataReason=null;
             if(!hasData){ score=null; disp="No data"; em={score:null,disp:"No data",detail:[]}; co2=null;
-              const stale = dsi && dsi.lastComm && (Date.now()-new Date(dsi.lastComm).getTime())>CONFIG.staleHours*3600e3;
+              const stale = dsi && dsi.lastComm && (Date.now()-new Date(dsi.lastComm).getTime())>SETTINGS.staleHours*3600e3;
               noDataReason = (dsi && (dsi.comm===false || stale)) ? ("Offline"+(dsi.lastComm?" \u00b7 "+timeSince(dsi.lastComm):"")) : "No engine data";
             } else { score=combine(terms); disp=score==null?"Unknown":disposition(dtc.items,terms); em=emissionsHealth(s); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackSlowDays); }
             const gids=(dev.groups||[]).map(g=>g.id).filter(id=>id && CONFIG.rootGroupIds.indexOf(id)<0);
@@ -489,13 +630,13 @@ geotab.addin.vehicleHealth = () => {
             return { id:dev.id, name:dev.name||dev.id, groups:gids, groupNames:gnames,
               vin, year, make, model, plate:dev.licensePlate||null,
               distanceMi, geotabRisk, lastComm:dsi?dsi.lastComm:null, comm:dsi?dsi.comm:null, noDataReason,
-              score, terms, disp, items:dtc.items, battOcc, deviceFaultCount:b.device.length,
+              score, terms, detail, disp, items:dtc.items, battOcc, deviceFaultCount:b.device.length,
               harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, usageKind, em, co2, noData:!hasData };
           });
           LOADING=false; lockRefresh(false); LAST_UPDATED=new Date(); SECTION_LIMIT={};
           renderAll();
           const trunc = TRUNC.length ? " \u00b7 <b style=\"color:#B54708\">\u26a0 "+TRUNC.join("/")+" truncated \u2014 narrow window/group</b>" : "";
-          setStatus("<b>"+COMPUTED.length+"</b> vehicles \u00b7 "+WINDOW_DAYS+"-day window \u00b7 <b>"+active.length+"</b> signals resolved"+trunc);
+          setStatus("<b>"+COMPUTED.length+"</b> vehicles \u00b7 "+WINDOW_DAYS+"-day window"+trunc);
           announce(COMPUTED.length+" vehicles loaded. "+actionNeededCount()+" need attention."+(TRUNC.length?" Warning: some results were truncated.":""));
           enrichVins();
         };
@@ -613,8 +754,46 @@ geotab.addin.vehicleHealth = () => {
   function stateBox(icon,colour,t,d){ return '<div class="vh-state"><div class="ico" style="color:'+colour+'">'+svg(icon,28)+'</div><div class="t">'+esc(t)+'</div><div class="d">'+esc(d)+'</div></div>'; }
 
   // ========================= rendering: grouped list + rows =========================
-  function chip(label,v){ return '<span class="vh-chip chip-'+fbClass(v)+'">'+esc(label)+' '+Math.round(v)+'</span>'; }
-  function contribHTML(terms){ return topContributors(terms).map(t=>chip(t.label,t.v)).join(""); }
+  // Plain-language risk chips: name the problem (and, for live signals, the actual reading) instead of a 0-100 number.
+  const chipBandClass = v => v==null?"g" : v>=75?"r" : v>=60?"o" : v>=40?"a" : "g";
+  function vchip(main,reading,v,title){
+    const rd = reading ? '<span class="vh-chip-rd">'+esc(reading)+'</span>' : '';
+    return '<span class="vh-chip chip-'+chipBandClass(v)+'"'+(title?' title="'+esc(title)+'"':'')+'>'
+      +'<span class="vh-chip-tx">'+esc(main)+'</span>'+rd+'</span>';
+  }
+  function worstFault(r){ if(!r.items||!r.items.length)return null;
+    let best=null; r.items.forEach(i=>{ if(best==null||(i.contribution||0)>(best.contribution||0))best=i; }); return best; }
+  // Short human reading for a factor's dominant signal (US-customary units), or "" if none.
+  function readingText(k,d){ if(!d)return ""; const who=d.who, val=d.value;
+    if(k==="T")return cToF(val)+"\u00b0F";
+    if(k==="P")return kpaToPsi(val)+" psi";
+    if(k==="B")return who==="battFault" ? (val+" fault"+(val>1?"s":"")) : (Math.round(val*10)/10).toFixed(1)+" V";
+    if(k==="M"){ if(who==="mil")return "check-engine on"; if(who==="oilLife")return Math.round(val)+"% oil life"; if(who==="defects")return val+" open defect"+(val>1?"s":""); }
+    return "";
+  }
+  function factorLabel(r,k){
+    if(k==="T")return "Running hot";
+    if(k==="P"){ const w=r.detail&&r.detail.P&&r.detail.P.who;
+      return w==="boost"?"High boost":w==="fuelPressure"?"Low fuel pressure":w==="oilPressure"?"Low oil pressure":"Low pressure"; }
+    if(k==="B")return "Weak battery";
+    if(k==="M"){ const w=r.detail&&r.detail.M&&r.detail.M.who; return w==="mil"?"Check-engine on":"Maintenance due"; }
+    return TERM_LABEL[k]||k;
+  }
+  function contribHTML(r){
+    const terms=r.terms; if(!terms)return "";
+    return topContributors(terms).map(c=>{
+      const k=c.k, v=c.v;
+      if(k==="DTC"){
+        const it=worstFault(r);
+        if(it){ const st=it.domState?String(it.domState).toLowerCase():"";
+          const rd=it.intermittent?((st?st+" \u00b7 ":"")+"intermittent"):st;
+          return vchip(it.name+(it.safety?" \u26a0":""), rd, v, it.name+(it.safety?" (safety system)":"")); }
+        return vchip("Engine fault","",v,"");
+      }
+      const main=factorLabel(r,k), rd=readingText(k, r.detail&&r.detail[k]);
+      return vchip(main, rd, v, main+(rd?" \u2014 "+rd:""));
+    }).join("");
+  }
   function behaviorChip(r){
     const u=r.terms&&r.terms.U;
     if(u==null||u<40) return "";   // only flag clearly elevated behaviour; full detail lives in the drawer
@@ -635,7 +814,7 @@ geotab.addin.vehicleHealth = () => {
       +'<span class="vh-rowname"><span class="vh-rowtop"><span class="vh-nm">'+esc(r.name)+'</span>'+dev+grp+'</span>'+sub+'</span>';
     if(TAB==="breakdown"){
       const mid = r.noData ? '<span class="vh-chip chip-none">'+esc(r.noDataReason||"No data")+'</span>'
-        : ((contribHTML(r.terms)+behaviorChip(r)) || '<span class="vh-chip chip-none">No active issues</span>');
+        : ((contribHTML(r)+behaviorChip(r)) || '<span class="vh-chip chip-none">No active issues</span>');
       const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+", risk score "+(r.score==null?"no data":Math.round(r.score)+" of 100")+". Activate for details.");
       return '<div class="vh-row bd'+(r.noData?" nodata":"")+'" role="button" tabindex="0" data-id="'+esc(r.id)+'" aria-label="'+aria+'">'
         +head+'<span class="vh-contrib">'+mid+'</span>'
@@ -855,6 +1034,113 @@ geotab.addin.vehicleHealth = () => {
     setTimeout(()=>URL.revokeObjectURL(url),1500);
   }
 
+  // ========================= settings panel (custom in-app modal; no browser dialogs) =========================
+  function pct(x){ return Math.round(x*100); }
+  function openSettings(){ ensureSettings(function(){ SET_FORM=JSON.parse(JSON.stringify(SETTINGS)); renderSettings(); showSettings(true); }); }
+  function closeSettings(){ showSettings(false); SET_FORM=null; }
+  function showSettings(on){
+    const sc=el("vh-mscrim"), md=el("vh-settings");
+    if(sc)sc.classList.toggle("on",!!on);
+    if(md){ md.classList.toggle("on",!!on); md.setAttribute("aria-hidden",on?"false":"true"); }
+    if(on){ const inp=md&&md.querySelector("input:not([disabled])"); const x=md&&md.querySelector(".vh-x"); const f=inp||x; if(f&&f.focus)f.focus(); }
+    else { const g=el("vh-settings-btn"); if(g&&g.focus)g.focus(); }
+  }
+  function presetRow(kind){
+    const active=presetName(kind,SET_FORM[kind]), ro=!CAN_EDIT_SETTINGS;
+    const order=[["high","High"],["medium","Medium"],["low","Low"]];
+    return '<div class="vh-preset" role="group" aria-label="'+kind+' sensitivity preset">'
+      + order.map(o=>'<button type="button" class="'+(active===o[0]?"on":"")+'" data-preset="'+kind+'" data-level="'+o[0]+'"'+(ro?" disabled":"")+'>'+o[1]+'</button>').join("")
+      + '</div>';
+  }
+  function numField(kind,which,label,unit,val,step){
+    const ro=!CAN_EDIT_SETTINGS;
+    return '<div class="vh-numf"><label>'+esc(label)+'</label><span class="row">'
+      + '<input type="number" inputmode="decimal" data-num="'+kind+'" data-which="'+which+'" value="'+val+'" step="'+step+'" min="0"'+(ro?" disabled":"")+' />'
+      + (unit?'<span class="unit">'+esc(unit)+'</span>':'') + '</span></div>';
+  }
+  function renderSettings(){
+    const md=el("vh-settings"); if(!md||!SET_FORM)return;
+    const ro=!CAN_EDIT_SETTINGS;
+    const banner = ro ? '<div class="vh-readonly">These settings are shared across your whole organization. Changing them requires Administrator or Supervisor access, so they\u2019re read-only for you.</div>' : '';
+    const harshN=SET_FORM.harsh.normal, harshC=SET_FORM.harsh.critical;
+    const idleN=pct(SET_FORM.idle.normal), idleC=pct(SET_FORM.idle.critical);
+    const stale=SET_FORM.staleHours;
+    md.innerHTML =
+      '<div class="vh-mhead"><div><h3 id="vh-set-title">Settings</h3>'
+        +'<p>Tune how sensitive scoring is to driving behavior and data freshness. Shared across your organization.</p></div>'
+        +'<button class="vh-x" type="button" aria-label="Close settings">'+svg("close",16)+'</button></div>'
+      +'<div class="vh-mbody">'+banner
+        +'<div class="vh-mform">'
+          +'<div class="vh-fset"><div class="vh-fset-h">Harsh-driving sensitivity</div>'
+            +'<div class="vh-fset-d">How many harsh-driving events (over the selected window) make a vehicle concerning, then critical. Lower = more sensitive.</div>'
+            + presetRow("harsh")
+            +'<div class="vh-nums">'+numField("harsh","normal","Concerning at","events",harshN,"1")
+            + numField("harsh","critical","Critical at","events",harshC,"1")+'</div></div>'
+          +'<div class="vh-fset"><div class="vh-fset-h">Idle sensitivity</div>'
+            +'<div class="vh-fset-d">What share of running time spent idling is too much. Transit fleets idle more than long-haul, so raise this if idle scores look high across the board.</div>'
+            + presetRow("idle")
+            +'<div class="vh-nums">'+numField("idle","normal","Concerning at","% idle",idleN,"1")
+            + numField("idle","critical","Critical at","% idle",idleC,"1")+'</div></div>'
+          +'<div class="vh-fset"><div class="vh-fset-h">Data freshness</div>'
+            +'<div class="vh-fset-d">Flag a vehicle as offline when it hasn\u2019t reported for longer than this.</div>'
+            +'<div class="vh-nums">'+numField("stale","stale","Offline after","hours",stale,"1")+'</div></div>'
+        +'</div></div>'
+      +'<div class="vh-mfoot">'
+        +'<button class="vh-btn vh-btn-ghost vh-set-reset" type="button"'+(ro?" disabled":"")+'>Reset to defaults</button>'
+        +'<span class="vh-msg" id="vh-set-msg" role="status" aria-live="polite"></span>'
+        +'<span class="sp"></span>'
+        +'<button class="vh-btn vh-btn-ghost vh-set-cancel" type="button">Cancel</button>'
+        +'<button class="vh-btn vh-set-save" type="button"'+(ro?" disabled":"")+'>Save</button>'
+      +'</div>';
+    wireSettings();
+  }
+  function wireSettings(){
+    const md=el("vh-settings"); if(!md)return;
+    const x=md.querySelector(".vh-x"); if(x)x.addEventListener("click",closeSettings);
+    const cx=md.querySelector(".vh-set-cancel"); if(cx)cx.addEventListener("click",closeSettings);
+    md.querySelectorAll("[data-preset]").forEach(b=>b.addEventListener("click",()=>{
+      const kind=b.getAttribute("data-preset"), lvl=b.getAttribute("data-level");
+      if(!PRESETS[kind]||!PRESETS[kind][lvl])return;
+      SET_FORM[kind]={ normal:PRESETS[kind][lvl].normal, critical:PRESETS[kind][lvl].critical };
+      renderSettings();
+    }));
+    md.querySelectorAll("[data-num]").forEach(inp=>inp.addEventListener("input",()=>{
+      const kind=inp.getAttribute("data-num"), which=inp.getAttribute("data-which"); const v=Number(inp.value);
+      if(!isFinite(v))return;
+      if(kind==="stale"){ SET_FORM.staleHours=v; }
+      else if(kind==="idle"){ SET_FORM.idle[which]=clamp(v/100,0,1); refreshPresetHighlight("idle"); }
+      else { SET_FORM.harsh[which]=v; refreshPresetHighlight("harsh"); }
+    }));
+    const rs=md.querySelector(".vh-set-reset"); if(rs)rs.addEventListener("click",()=>{ SET_FORM=defaultSettings(); renderSettings(); });
+    const sv=md.querySelector(".vh-set-save"); if(sv)sv.addEventListener("click",onSaveSettings);
+  }
+  // Esc-to-close + Tab focus-trap for the modal. Bound ONCE (in initialize) to #vh-settings, which persists across
+  // re-renders - binding it inside wireSettings (run on every render) would stack duplicate listeners.
+  function settingsKeydown(e){
+    if(e.key==="Escape"){ e.preventDefault(); closeSettings(); return; }
+    if(e.key!=="Tab")return;
+    const md=el("vh-settings"); if(!md)return;
+    const f=md.querySelectorAll("button:not([disabled]),input:not([disabled])"); if(!f.length)return;
+    const first=f[0], last=f[f.length-1];
+    if(e.shiftKey&&document.activeElement===first){ e.preventDefault(); last.focus(); }
+    else if(!e.shiftKey&&document.activeElement===last){ e.preventDefault(); first.focus(); }
+  }
+  function refreshPresetHighlight(kind){
+    const md=el("vh-settings"); if(!md)return;
+    const active=presetName(kind,SET_FORM[kind]);
+    md.querySelectorAll('[data-preset="'+kind+'"]').forEach(b=>b.classList.toggle("on", b.getAttribute("data-level")===active));
+  }
+  function setMsg(text,cls){ const m=el("vh-set-msg"); if(m){ m.textContent=text||""; m.className="vh-msg"+(cls?" "+cls:""); } }
+  function onSaveSettings(){
+    const md=el("vh-settings"); const sv=md&&md.querySelector(".vh-set-save"); if(sv)sv.disabled=true;
+    setMsg("Saving\u2026","");
+    saveSettings(SET_FORM, function(ok,msg){
+      if(sv)sv.disabled=false;
+      if(ok){ setMsg("Saved \u2014 scores updated.","ok"); run(); setTimeout(closeSettings,650); }
+      else { setMsg(msg||"Save failed.","err"); }
+    });
+  }
+
   // ========================= lifecycle =========================
   return {
     initialize(api,state,callback){ API=api; STATE=state;
@@ -869,12 +1155,15 @@ geotab.addin.vehicleHealth = () => {
       on("vh-view-group","click",()=>setView("group"));
       on("vh-export","click",exportCSV);
       on("vh-scrim","click",closeDrawer);
-      document.addEventListener("keydown",e=>{ if(e.key==="Escape")closeDrawer(); });
+      on("vh-settings-btn","click",openSettings);
+      on("vh-mscrim","click",closeSettings);
+      on("vh-settings","keydown",settingsKeydown);
+      document.addEventListener("keydown",e=>{ if(e.key==="Escape"){ closeDrawer(); closeSettings(); } });
       const si=el("vh-search"); let t=null;
       if(si){ si.value=SEARCH; si.addEventListener("input",()=>{ const v=si.value.trim(); clearTimeout(t); t=setTimeout(()=>setSearch(v),130); }); }
       if(callback)callback();
     },
-    focus(api,state){ API=api; STATE=state; run(); },
+    focus(api,state){ API=api; STATE=state; ensureSettings(run); },
     blur(){ closeDrawer(); }
   };
 };

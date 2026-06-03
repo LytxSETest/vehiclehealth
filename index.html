@@ -162,7 +162,9 @@
   .vh-contrib{ display:flex; gap:6px; flex-wrap:wrap; }
   .vh-finding{ font-size:12.5px; color:var(--fg-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .vh-chip{ display:inline-flex; align-items:center; font-size:11.5px; font-weight:700; padding:2px 9px; border-radius:var(--r-pill);
-    border:1px solid transparent; white-space:nowrap; }
+    border:1px solid transparent; white-space:nowrap; max-width:240px; }
+  .vh-chip .vh-chip-tx{ overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .vh-chip .vh-chip-rd{ font-weight:600; margin-left:6px; opacity:.72; flex:none; }
   .chip-r{ color:#B42318; background:#FEF3F2; border-color:#FECDCA; }
   .chip-o{ color:#B54708; background:#FFF6ED; border-color:#FDDCAB; }
   .chip-a{ color:#854A0E; background:#FFFAEB; border-color:#FEDF89; }
@@ -265,6 +267,46 @@
   .vh-callout b{ color:var(--fg); }
   .vh-muted{ color:var(--fg-3); }
 
+  /* ---------- settings modal ---------- */
+  .vh-mscrim{ position:fixed; inset:0; background:rgba(16,24,40,.4); backdrop-filter:blur(2px);
+    opacity:0; pointer-events:none; transition:opacity .2s; z-index:50; }
+  .vh-mscrim.on{ opacity:1; pointer-events:auto; }
+  .vh-modal{ position:fixed; z-index:51; top:50%; left:50%; width:min(540px,94vw); max-height:90vh; overflow:auto;
+    background:var(--surface); border:1px solid var(--line); border-radius:var(--r); box-shadow:0 24px 64px rgba(16,24,40,.28);
+    opacity:0; pointer-events:none; transform:translate(-50%,-48%) scale(.985);
+    transition:opacity .2s var(--ease), transform .2s var(--ease); }
+  .vh-modal.on{ opacity:1; pointer-events:auto; transform:translate(-50%,-50%) scale(1); }
+  .vh-mhead{ display:flex; align-items:flex-start; gap:12px; padding:18px 20px; border-bottom:1px solid var(--line); }
+  .vh-mhead h3{ margin:0; font-size:17px; font-weight:800; color:var(--fg); }
+  .vh-mhead p{ margin:3px 0 0; font-size:12px; color:var(--fg-3); line-height:1.5; }
+  .vh-mbody{ padding:4px 20px; }
+  .vh-mform{ display:flex; flex-direction:column; }
+  .vh-fset{ padding:16px 0; border-bottom:1px solid var(--line); }
+  .vh-fset:last-child{ border-bottom:none; }
+  .vh-fset-h{ font-size:13.5px; font-weight:800; color:var(--fg); }
+  .vh-fset-d{ font-size:12px; color:var(--fg-3); margin:2px 0 11px; line-height:1.5; }
+  .vh-preset{ display:inline-flex; padding:3px; background:#EEF1F4; border:1px solid var(--line); border-radius:var(--r-pill); margin-bottom:12px; }
+  .vh-preset button{ border:none; background:none; color:var(--fg-3); cursor:pointer; font-size:12.5px; font-weight:700;
+    padding:6px 14px; min-height:32px; border-radius:var(--r-pill); transition:color .14s, background .14s; }
+  .vh-preset button:hover:not(:disabled){ color:var(--fg); }
+  .vh-preset button.on{ color:#0B2447; background:var(--surface); box-shadow:0 1px 2px rgba(16,24,40,.16); }
+  .vh-preset button:disabled{ opacity:.55; cursor:default; }
+  .vh-nums{ display:flex; gap:16px; flex-wrap:wrap; }
+  .vh-numf{ display:flex; flex-direction:column; gap:5px; }
+  .vh-numf label{ font-size:11px; font-weight:700; letter-spacing:.03em; text-transform:uppercase; color:var(--fg-3); }
+  .vh-numf .row{ display:inline-flex; align-items:center; gap:7px; }
+  .vh-numf input{ font-family:inherit; font-size:14px; color:var(--fg); width:94px; min-height:36px; font-variant-numeric:tabular-nums;
+    background:var(--surface); border:1px solid var(--line-2); border-radius:var(--r-sm); padding:7px 10px; }
+  .vh-numf input:focus{ border-color:var(--brand); outline:none; box-shadow:0 0 0 3px rgba(0,134,201,.12); }
+  .vh-numf input:disabled{ opacity:.6; background:var(--surface-2); cursor:default; }
+  .vh-numf .unit{ font-size:12px; color:var(--fg-3); }
+  .vh-readonly{ font-size:12.5px; color:#854A0E; background:#FFFAEB; border:1px solid #FEDF89; border-radius:var(--r-sm);
+    padding:10px 12px; margin:12px 0 2px; line-height:1.5; }
+  .vh-mfoot{ display:flex; align-items:center; gap:10px; padding:15px 20px; border-top:1px solid var(--line); background:var(--surface-2); flex-wrap:wrap; }
+  .vh-mfoot .sp{ margin-left:auto; }
+  .vh-msg{ font-size:12px; font-weight:700; }
+  .vh-msg.ok{ color:#2D6A2F; } .vh-msg.err{ color:#B42318; }
+
   /* ---------- footer ---------- */
   .vh-footer{ padding:18px 22px 26px; margin-top:14px; border-top:1px solid var(--line); color:var(--fg-3); font-size:11px; }
   .vh-footer .tag{ font-weight:700; letter-spacing:.07em; text-transform:uppercase; color:var(--fg-2); }
@@ -300,6 +342,10 @@
           <option value="30">30 days</option><option value="90">90 days</option>
         </select>
       </label>
+      <button id="vh-settings-btn" class="vh-btn vh-btn-ghost" type="button" aria-label="Settings" title="Settings">
+        <svg class="vh-i" width="16" height="16" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="3"/><path d="M11 1.8v2.4M11 17.8v2.4M2.2 11h2.4M17.4 11h2.4M4.8 4.8l1.7 1.7M15.5 15.5l1.7 1.7M4.8 17.2l1.7-1.7M15.5 6.5l1.7-1.7"/></svg>
+        <span>Settings</span>
+      </button>
       <button id="vh-refresh" class="vh-btn" type="button">Refresh</button>
     </div>
   </div>
@@ -330,12 +376,15 @@
 
   <div class="vh-footer">
     <div class="tag">Protecting a world in motion</div>
-    <div class="note">Scores are operational triage signals, not certified diagnostics &mdash; tune thresholds in CONFIG. CO&#8322; figures are fuel-derived estimates; use the Geotab Sustainability Center for certified reporting.</div>
+    <div class="note">Scores are operational triage signals, not certified diagnostics &mdash; tune sensitivity in Settings. CO&#8322; figures are fuel-derived estimates; use the Geotab Sustainability Center for certified reporting.</div>
     <div class="note">&ldquo;Lytx+&rdquo; and the Lytx+ logo are trademarks of Lytx, Inc. &ldquo;Geotab&rdquo; and the Geotab logo are registered trademarks of Geotab, Inc. in the United States and other countries.</div>
   </div>
 
   <div id="vh-scrim" class="vh-scrim"></div>
   <div id="vh-drawer" class="vh-drawer" role="dialog" aria-modal="true" aria-labelledby="vh-dtitle" aria-hidden="true"></div>
+
+  <div id="vh-mscrim" class="vh-mscrim"></div>
+  <div id="vh-settings" class="vh-modal" role="dialog" aria-modal="true" aria-labelledby="vh-set-title" aria-hidden="true"></div>
 </div>
 
 <script src="https://lytxsetest.github.io/vehiclehealth/app.js"></script>
