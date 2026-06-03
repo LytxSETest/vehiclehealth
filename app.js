@@ -90,24 +90,61 @@ geotab.addin.vehicleHealth = () => {
     return "vehicle";
   }
   function isSafetyFault(name){ return CONFIG.safetySystemKeywords.some(k=>lc(name).indexOf(k)>-1); }
-  // Geotab names unrecognized SPN/FMI codes like "**Unknown Diagnostic 521940" - make that readable.
-  function cleanDiagName(nm,id){
-    let s=String(nm==null?"":nm).replace(/\*/g,"").trim();
+  // J1939 FMI (Failure Mode Identifier) - standardized failure modes per SAE J1939-73. 22-30 are reserved.
+  const FMI_TEXT = {
+    0:"above normal range (most severe)", 1:"below normal range (most severe)",
+    2:"data erratic or intermittent", 3:"voltage above normal / shorted high",
+    4:"voltage below normal / shorted low", 5:"current below normal / open circuit",
+    6:"current above normal / grounded", 7:"mechanical system not responding",
+    8:"abnormal frequency or pulse width", 9:"abnormal update rate", 10:"abnormal rate of change",
+    11:"root cause not known", 12:"bad intelligent device or component", 13:"out of calibration",
+    14:"special instructions", 15:"above normal range (least severe)", 16:"above normal range (moderate)",
+    17:"below normal range (least severe)", 18:"below normal range (moderate)",
+    19:"received network data in error", 20:"data drifted high", 21:"data drifted low", 31:"condition exists" };
+  function fmiText(code){ if(code==null||code==="")return ""; return FMI_TEXT[Number(code)]||""; }
+  // SAE J1939-73 reserves SPN 520192-524287 for proprietary, manufacturer-specific diagnostics.
+  const PROP_SPN_MIN=520192, PROP_SPN_MAX=524287;
+  // Conservative set of common STANDARD J1939 SPNs - only labels codes Geotab itself left unnamed (rare, since
+  // Geotab already names standard SPNs). Always presented as "Likely ... - verify", never asserted as fact.
+  const SPN_STD = {
+    84:"wheel-based vehicle speed", 91:"accelerator pedal position", 92:"engine percent load",
+    94:"fuel delivery pressure", 98:"engine oil level", 100:"engine oil pressure",
+    102:"intake manifold (boost) pressure", 105:"intake manifold temperature", 108:"barometric pressure",
+    110:"engine coolant temperature", 111:"coolant level", 157:"injector rail pressure",
+    158:"keyswitch battery voltage", 168:"battery / electrical potential", 171:"ambient air temperature",
+    174:"fuel temperature", 175:"engine oil temperature", 177:"transmission oil temperature",
+    190:"engine speed", 247:"engine total hours", 411:"EGR differential pressure", 412:"EGR temperature",
+    512:"driver demand engine torque", 513:"actual engine torque", 639:"J1939 data link",
+    1127:"turbocharger boost pressure", 1761:"DEF tank level", 3216:"aftertreatment intake NOx",
+    3226:"aftertreatment outlet NOx", 3242:"DPF intake temperature", 3246:"DPF outlet temperature",
+    3251:"DPF differential pressure", 3719:"DPF soot load", 5246:"SCR inducement severity" };
+  // Classify a diagnostic for display. Recognized -> Geotab's own name. Unrecognized ("**Unknown Diagnostic N")
+  // -> identify by J1939 SPN: known standard SPN -> "Likely <param>"; proprietary range -> "Manufacturer-specific";
+  // otherwise "Unrecognized". Never invents a meaning; std/proprietary labels carry a verify-with-OEM caveat.
+  function classifyDiag(nm){
+    const s=String(nm==null?"":nm).replace(/\*/g,"").trim();
     const m=s.match(/unknown diagnostic\s*([0-9]+)/i);
-    if(m) return "Unrecognized engine fault \u00b7 code "+m[1];
-    if(s) return s;
-    return "Unrecognized engine fault";
+    if(!m) return { label: s || "Unrecognized fault", spn:null, klass:"named" };
+    const spn=Number(m[1]);
+    if(SPN_STD[spn]) return { label:"Likely "+SPN_STD[spn]+" \u00b7 code "+spn, spn, klass:"std" };
+    if(spn>=PROP_SPN_MIN && spn<=PROP_SPN_MAX) return { label:"Manufacturer-specific \u00b7 code "+spn, spn, klass:"proprietary" };
+    return { label:"Unrecognized fault \u00b7 code "+spn, spn, klass:"unknown" };
   }
 
-  function groupByDiagnostic(records,nameById){
+  function groupByDiagnostic(records,nameById,fmById){
+    fmById=fmById||{};
     const by={};
     records.forEach(f=>{ const id=f.diagnostic&&f.diagnostic.id; if(!id)return;
-      const g=by[id]||(by[id]={id,name:cleanDiagName(nameById[id],id),occurrences:0,states:{},worstSeverity:null,worstLamp:0,maxRisk:null,safety:false,first:f.dateTime,last:f.dateTime});
+      let g=by[id];
+      if(!g){ const c=classifyDiag(nameById[id]); g=by[id]={id,name:c.label,spn:c.spn,codeClass:c.klass,occurrences:0,states:{},worstSeverity:null,worstLamp:0,maxRisk:null,safety:false,fmi:null,fmiName:null,_fmiLamp:-1,first:f.dateTime,last:f.dateTime}; }
       g.occurrences++; const st=stateOf(f); g.states[st]=(g.states[st]||0)+1;
       const sv=severityToScore(f.severity||f.diagnosticSeverity); if(sv!=null)g.worstSeverity=Math.max(g.worstSeverity||0,sv);
-      g.worstLamp=Math.max(g.worstLamp,lampToScore(f));
+      const lamp=lampToScore(f); g.worstLamp=Math.max(g.worstLamp,lamp);
       if(typeof f.riskOfBreakdown==="number")g.maxRisk=Math.max(g.maxRisk||0,f.riskOfBreakdown);
       if(isSafetyFault(g.name))g.safety=true;
+      // FMI from the record carrying the strongest lamp (the representative failure mode for this code)
+      const fm = (f.failureMode && f.failureMode.id && fmById[f.failureMode.id]) || null;
+      if(fm && fm.code!=null && lamp>=g._fmiLamp){ g.fmi=fm.code; g.fmiName=fm.name; g._fmiLamp=lamp; }
       if(f.dateTime<g.first)g.first=f.dateTime; if(f.dateTime>g.last)g.last=f.dateTime; });
     return Object.keys(by).map(k=>by[k]);
   }
@@ -121,12 +158,16 @@ geotab.addin.vehicleHealth = () => {
     const intermittent=(active>0&&inactive>0)||(g.occurrences>=5&&active>0);
     return Object.assign(g,{badness,domState:dom,intermittent,contribution:clamp(badness*mult*(intermittent?1.1:1.0),0,100)});
   }
+  // recurrence points for one fault, by how many times it fired in the window (bounded per fault)
+  function recurrencePts(occ){ occ=occ||0; return occ>=20?6 : occ>=10?4 : occ>=5?2 : occ>=2?1 : 0; }
   function dtcTerm(groups){
     if(!groups.length)return {score:0,items:[]};
     const items=groups.map(scoreFaultGroup);
     const worst=maxOf(items.map(i=>i.contribution))||0;
-    const moderate=items.filter(i=>i.contribution>=40).length;
-    return {score:clamp(worst+Math.min(20,Math.max(0,moderate-1)*5),0,100),items};
+    // DTC = "severity AND frequency": worst fault's severity score, lifted by a bounded frequency
+    // component = recurrence points summed over ACTIVE faults (so repeat/recurring faults count).
+    const freq=clamp(items.reduce((a,i)=>a+(i.domState==="Active"?recurrencePts(i.occurrences):0),0),0,25);
+    return {score:clamp(worst+freq,0,100),items,freq};
   }
 
   // ---- term builders ----
@@ -419,7 +460,7 @@ geotab.addin.vehicleHealth = () => {
   const svg = (name, sz) => '<svg class="vh-i" width="'+(sz||16)+'" height="'+(sz||16)+'" viewBox="0 0 22 22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">'+(ICON[name]||"")+'</svg>';
 
   // ========================= state =========================
-  let API=null, STATE=null, NAME_BY_ID={}, GROUP_BY_ID={}, COMPUTED=[], LOADING=false, LAST_UPDATED=null, DB="";
+  let API=null, STATE=null, NAME_BY_ID={}, GROUP_BY_ID={}, FM_BY_ID={}, COMPUTED=[], LOADING=false, LAST_UPDATED=null, DB="";
   let TAB="breakdown", VIEW="list", FILTER=null, FILTER_ID="all", SEARCH="", WINDOW_DAYS=30;
   let COLLAPSED={};          // `${tab}:${actionId}` -> true if collapsed
   let SECTION_LIMIT={};      // `${tab}:${actionId}` -> rows currently shown
@@ -547,12 +588,14 @@ geotab.addin.vehicleHealth = () => {
       ["Get",{typeName:"Group",resultsLimit:CONFIG.maxGroups}],
       ["Get",{typeName:"Trip",search:{fromDate:fFrom},resultsLimit:CONFIG.tripLimit}],
       ["Get",{typeName:"DeviceStatusInfo",resultsLimit:CONFIG.maxDevices}],
+      ["Get",{typeName:"FailureMode",resultsLimit:5000}],
     ], r => {
-      const devices=r[0],faults=r[1],exceptions=r[2],dvirs=r[3],rules=r[4],allGroups=r[5],trips=r[6],dsiAll=r[7];
+      const devices=r[0],faults=r[1],exceptions=r[2],dvirs=r[3],rules=r[4],allGroups=r[5],trips=r[6],dsiAll=r[7],failModes=r[8];
       if(!devices||!devices.length){ LOADING=false; lockRefresh(false); COMPUTED=[]; LAST_UPDATED=new Date();
         setStatus("No vehicles for the current group filter."); renderAll(); return; }
       const idSet=new Set(devices.map(d=>d.id));
       GROUP_BY_ID={}; (allGroups||[]).forEach(g=>{ GROUP_BY_ID[g.id]=g.name||g.id; });
+      FM_BY_ID={}; (failModes||[]).forEach(m=>{ if(m&&m.id)FM_BY_ID[m.id]={code:m.code, name:m.name}; });
       // truncation guard: a Get that returns exactly its cap probably lost records
       TRUNC=[]; if((faults||[]).length>=CONFIG.faultLimit)TRUNC.push("faults"); if((exceptions||[]).length>=CONFIG.exceptionLimit)TRUNC.push("events"); if((trips||[]).length>=CONFIG.tripLimit)TRUNC.push("trips");
 
@@ -599,7 +642,7 @@ geotab.addin.vehicleHealth = () => {
         const compute=(latestBy,firstBy)=>{
           COMPUTED=devices.map(dev=>{
             const b=perDev[dev.id], s=latestBy[dev.id]||{}, f0=firstBy[dev.id]||{};
-            const dtc=dtcTerm(groupByDiagnostic(b.vehicle,NAME_BY_ID));
+            const dtc=dtcTerm(groupByDiagnostic(b.vehicle,NAME_BY_ID,FM_BY_ID));
             const battOcc=b.battery.length;
             const harsh=harshByDev[dev.id]!=null?harshByDev[dev.id]:null;
             const openDef=defectsByDev[dev.id]!=null?defectsByDev[dev.id]:null;
@@ -907,15 +950,36 @@ geotab.addin.vehicleHealth = () => {
     return '<div class="vh-trm"><span class="lab">'+esc(label)+'</span><span class="tk"><i class="fb-'+fbClass(v)+'" style="width:'+Math.max(3,Math.round(v))+'%"></i></span><span class="v">'+Math.round(v)+'</span></div>'; }
 
   // Labeled gauge that anchors the breakdown score: 0-100 scale, banded track, marker, band-coloured value.
+  // When the recommended action is more serious than the composite score implies, name what drove it
+  // (a fault, a weak battery, a hot/over-pressure reading) so the gauge can explain the mismatch. "" = no mismatch.
+  function escalationDriver(r){
+    if(r.score==null)return "";
+    const v=Math.round(r.score);
+    const floor={ "Remove from service":60, "Service now":60, "Schedule diagnostic":40 }[r.disp];
+    if(floor==null || v>=floor) return "";   // action matches the score - nothing to reconcile
+    const active=(r.items||[]).filter(i=>i.domState==="Active").sort((a,b)=>(b.contribution||0)-(a.contribution||0));
+    const af=active[0];
+    if(af && (af.worstLamp>=60 || (af.worstSeverity||0)>=60 || (af.maxRisk||0)>=CONFIG.riskServiceNow || af.safety))
+      return "a specific active fault \u2014 "+af.name;
+    if(r.terms && r.terms.B!=null && r.terms.B>=60) return "a weak battery ("+Math.round(r.terms.B)+"/100)";
+    if(r.terms && r.terms.T!=null && r.terms.T>=CONFIG.signalActionBand) return "a high temperature reading";
+    if(r.terms && r.terms.P!=null && r.terms.P>=CONFIG.signalActionBand) return "an abnormal pressure reading";
+    if(af) return "an active fault";
+    const pf=(r.items||[]).filter(i=>i.domState==="Pending")[0];
+    if(pf) return "a pending fault \u2014 "+pf.name;
+    if((r.items||[]).some(i=>i.intermittent)) return "an intermittent fault";
+    if((r.items||[]).length) return "a diagnostic fault";
+    return "";
+  }
   function riskGauge(r){
     if(r.score==null){
       return '<div class="vh-gauge nodata"><div class="vh-gauge-top"><span class="vh-gauge-num na">\u2014</span>'
         +'<span class="vh-gauge-sub">no engine data to score</span></div></div>';
     }
     const v=Math.round(r.score), pos=clamp(v,0,100), col=bandColor(v);
-    const urgent=(r.disp==="Service now"||r.disp==="Remove from service");
-    const note=(urgent && v<60)
-      ? '<div class="vh-gauge-note">Overall risk is '+(v<40?"low":"moderate")+'. This vehicle is flagged \u201c'+esc(r.disp)+'\u201d because of a specific active fault, not its composite score.</div>'
+    const driver=escalationDriver(r);
+    const note=driver
+      ? '<div class="vh-gauge-note">Overall risk is '+(v<40?"low":"moderate")+' ('+v+'/100). This vehicle is flagged \u201c'+esc(r.disp)+'\u201d because of '+esc(driver)+', not its composite score.</div>'
       : '';
     return '<div class="vh-gauge">'
       +'<div class="vh-gauge-top"><span class="vh-gauge-num" style="color:'+col+'">'+v+'<span class="vh-gauge-max">/100</span></span>'
@@ -931,7 +995,9 @@ geotab.addin.vehicleHealth = () => {
       +termRow("Faults \u00b7 "+(w.DTC*100)+"%","DTC",r.terms)+termRow("Temp \u00b7 "+(w.T*100)+"%","T",r.terms)
       +termRow("Pressure \u00b7 "+(w.P*100)+"%","P",r.terms)+termRow("Usage \u00b7 "+(w.U*100)+"%","U",r.terms)
       +termRow("Maint \u00b7 "+(w.M*100)+"%","M",r.terms)+termRow("Battery \u00b7 "+(w.B*100)+"%","B",r.terms)+'</div>';
-    const frows=r.items.length?r.items.map(i=>'<tr><td>'+esc(i.name)+(i.safety?' \u26a0':'')+'</td><td>'+esc(i.domState)+(i.intermittent?' \u00b7 intermittent':'')
+    const fmiHTML=i=>{ if(i.fmi==null)return ""; const t=fmiText(i.fmi)||(i.fmiName?String(i.fmiName):"");
+      return '<div style="font-size:11px;color:#667085;font-weight:400;margin-top:2px">'+(t?esc(t)+' ':'')+'(FMI '+i.fmi+')</div>'; };
+    const frows=r.items.length?r.items.map(i=>'<tr><td>'+esc(i.name)+(i.safety?' \u26a0':'')+fmiHTML(i)+'</td><td>'+esc(i.domState)+(i.intermittent?' \u00b7 intermittent':'')
       +'</td><td class="num">'+(i.worstSeverity!=null?Math.round(i.worstSeverity):"\u2014")+'</td><td class="num">'+(i.maxRisk!=null?i.maxRisk.toFixed(1)+"%":"\u2014")
       +'</td><td class="num">'+i.occurrences+'</td><td class="num">'+Math.round(i.contribution)+'</td></tr>').join("")
       :'<tr><td colspan="6" class="vh-muted">No vehicle ECU faults in window.</td></tr>';
@@ -941,6 +1007,7 @@ geotab.addin.vehicleHealth = () => {
     if(r.harsh)notes.push(r.harsh+" harsh-driving event(s) in window \u2192 Usage factor.");
     if(r.openDefects)notes.push(r.openDefects+" open DVIR defect(s) \u2192 Maintenance factor.");
     if(r.deviceFaultCount)notes.push(r.deviceFaultCount+" telematics device record(s) (excluded from score).");
+    if(r.items&&r.items.some(i=>i.codeClass==="proprietary"||i.codeClass==="std")) notes.push("\u201cManufacturer-specific\u201d / \u201cLikely\u2026\u201d codes are identified only by their J1939 SPN \u2014 the meaning is unconfirmed; verify with the OEM diagnosis before acting.");
     const ns=notes.length?'<ul class="vh-notes">'+notes.map(n=>'<li>'+esc(n)+'</li>').join("")+'</ul>':'';
     const gr=r.geotabRisk!=null?'<div class="vh-callout" style="margin-bottom:12px">Geotab predicted breakdown risk: <b>'+Math.round(r.geotabRisk)+'%</b> <span class="vh-muted">(Geotab\u2019s own model, shown for comparison)</span></div>':'';
     return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Breakdown risk</h4><div class="vh-dsec-meta">'+pill(r.disp)+'</div></div>'
