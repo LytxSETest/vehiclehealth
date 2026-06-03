@@ -25,7 +25,7 @@ geotab.addin.vehicleHealth = () => {
     signals: {
       coolant:      { id:"DiagnosticEngineCoolantTemperatureId", keyword:"engine coolant temperature", dir:"high", normal:105, critical:120, term:"T" },
       oilTemp:      { keyword:"engine oil temperature", dir:"high", normal:120, critical:140, term:"T" },
-      transTemp:    { keyword:"transmission", dir:"high", normal:110, critical:130, term:"T" },
+      transTemp:    { keyword:"transmission oil temperature", dir:"high", normal:110, critical:130, term:"T" },
       oilPressure:  { keyword:"oil pressure", dir:"low",  normal:200, critical:80,  term:"P" },
       fuelPressure: { keyword:"fuel rail pressure", dir:"low", normal:300, critical:150, term:"P" },
       boost:        { keyword:"turbo boost", dir:"high", normal:200, critical:300, term:"P" },
@@ -43,8 +43,13 @@ geotab.addin.vehicleHealth = () => {
       monEGR:       { id:"a2cJr2HdL9UiQeEcvYL_Wkw", keyword:"egr system monitor complete" },
       monMisfire:   { id:"aDn7Ky78pnUmai2B3dmPmqQ", keyword:"misfire monitor complete" },
       dpfSoot:      { keyword:"particulate filter 1 soot", dir:"high", normal:60, critical:90 },
-      defLevel:     { keyword:"diesel exhaust fluid", dir:"low", normal:20, critical:5 },
-      noxIn:        { keyword:"nox", dir:"high" }, noxOut: { keyword:"outlet nox", dir:"high" },
+      defLevel:     { keyword:"def level", dir:"low", normal:20, critical:5 },
+      dpfIntakeTemp:{ keyword:"diesel particulate filter intake gas temperature" },
+      dpfOutletTemp:{ keyword:"diesel particulate filter outlet gas temperature" },
+      dpfIntakePress:{ keyword:"diesel particulate filter intake pressure" },
+      dpfRegen:     { keyword:"diesel particulate filter regeneration status" },
+      regenInhibit: { keyword:"aft regen inhibit status" },
+      noxIn:        { keyword:"aftertreatment 1 intake nox", dir:"high" }, noxOut: { keyword:"aftertreatment 1 outlet nox", dir:"high" },
       predictedRisk:{ id:"DiagnosticPredictedRiskOfBreakdownId", keyword:"predicted breakdown risk" }, // Geotab's own model (info only, not scored)
     },
     // ---- usage / harsh normalisation ----
@@ -123,7 +128,7 @@ geotab.addin.vehicleHealth = () => {
   // otherwise "Unrecognized". Never invents a meaning; std/proprietary labels carry a verify-with-OEM caveat.
   function classifyDiag(nm){
     const s=String(nm==null?"":nm).replace(/\*/g,"").trim();
-    const m=s.match(/unknown diagnostic\s*([0-9]+)/i);
+    const m=s.match(/unknown\s+diagnostic\s*([0-9]+)/i);
     if(!m) return { label: s || "Unrecognized fault", spn:null, klass:"named" };
     const spn=Number(m[1]);
     if(SPN_STD[spn]) return { label:"Likely "+SPN_STD[spn]+" \u00b7 code "+spn, spn, klass:"std" };
@@ -351,35 +356,65 @@ geotab.addin.vehicleHealth = () => {
     return d;
   }
 
-  const DISP_RANK={ "Remove from service":5, "Service now":4, "Schedule diagnostic":3, "Watch \u2013 intermittent":2, "Monitor":1, "OK":0, "Unknown":-1 };
+  const DISP_RANK={ "Remove from service":5, "Service now":4, "Schedule diagnostic":3, "Watch \u2013 intermittent":2, "Monitor":1, "OK":0, "Unknown":-1,
+                    "Attention":4, "Recheck":3, "No data":-1 };
   const dispRank=d=>DISP_RANK[d]!=null?DISP_RANK[d]:0;
 
   // ---- emissions (Section 2) ----
   function emissionsHealth(s){
-    const detail=[], parts=[];
-    const milOn = s.milDistance!=null && s.milDistance>0;
-    if(milOn){ parts.push(80); detail.push("Check-engine (MIL) on; driven "+Math.round(s.milDistance)+" m with it on"); }
-    // heavy-duty aftertreatment
-    const dpf=signalBadness(s.dpfSoot,CONFIG.signals.dpfSoot.normal,CONFIG.signals.dpfSoot.critical,"high");
-    if(dpf!=null){ parts.push(dpf); detail.push("DPF soot load "+Math.round(s.dpfSoot)+"%"); }
-    const def=signalBadness(s.defLevel,CONFIG.signals.defLevel.normal,CONFIG.signals.defLevel.critical,"low");
-    if(def!=null){ parts.push(def); detail.push("DEF level "+Math.round(s.defLevel)+"%"); }
-    if(s.noxIn!=null&&s.noxOut!=null&&s.noxIn>0){ const ratio=s.noxOut/s.noxIn; const b=ratio<=0.3?0:ratio>=0.8?100:clamp((ratio-0.3)/0.5*100,0,100);
-      parts.push(b); detail.push("NOx out/in ratio "+ratio.toFixed(2)+" (SCR efficiency)"); }
-    // monitor readiness
-    const mons=["monCatalyst","monO2","monEGR","monMisfire"]; let incomplete=0,have=0;
-    mons.forEach(k=>{ const v=s[k]; if(v!=null){ have++; if(v===0)incomplete++; } });
-    if(incomplete>0){ parts.push(Math.min(30,incomplete*10)); detail.push(incomplete+" of "+have+" OBD monitors incomplete"); }
-    const recentClear = s.distSinceClear!=null && s.distSinceClear>=0 && s.distSinceClear<16000; // <~10mi
-    if(recentClear && incomplete>0){ parts.push(40); detail.push("Codes cleared recently with monitors not yet complete \u2013 possible masking"); }
-    const score = parts.length?Math.max.apply(null,parts):(have>0||milOn===false?0:null);
-    let disp="OK";
-    if(score==null)disp="Unknown";
-    else if(milOn||(dpf!=null&&dpf>=100)||(def!=null&&def>=100))disp="Service emissions system";
-    else if((s.noxIn!=null&&s.noxOut!=null)&&score>=60)disp="Check SCR / aftertreatment";
-    else if(recentClear&&incomplete>0)disp="Recheck after drive cycle";
-    else if(score>=40)disp="Monitor";
-    return { score, disp, detail };
+    const rows=[], detail=[], parts=[];
+    let worstState="ok"; const RANK={ok:0,recheck:1,attention:2};
+    const bump=st=>{ if(RANK[st]>RANK[worstState])worstState=st; };
+    const monKeys=["monCatalyst","monO2","monEGR","monMisfire"];
+    const hasMon = monKeys.some(k=>s[k]!=null) || s.milDistance!=null;
+    const hasDiesel = s.defLevel!=null||s.dpfIntakeTemp!=null||s.dpfOutletTemp!=null||s.dpfIntakePress!=null||s.dpfRegen!=null||s.dpfSoot!=null||(s.noxIn!=null&&s.noxOut!=null);
+    const kind = hasMon ? "gas" : (hasDiesel ? "diesel" : "none");
+    let headline="";
+
+    if(kind==="gas"){
+      // Inspection readiness: OBD-II monitor completion + MIL + recent-code-clear masking.
+      const milOn = s.milDistance!=null && s.milDistance>0;
+      if(milOn){ parts.push(80); bump("attention"); detail.push("Check-engine (MIL) on"); rows.push({label:"Check-engine light",value:"on",state:"attention"}); }
+      else if(s.milDistance!=null){ rows.push({label:"Check-engine light",value:"off",state:"ok"}); }
+      const monLabel={monCatalyst:"Catalyst monitor",monO2:"O\u2082 sensor monitor",monEGR:"EGR monitor",monMisfire:"Misfire monitor"};
+      let incomplete=0,have=0; const incNames=[];
+      monKeys.forEach(k=>{ const v=s[k]; if(v!=null){ have++; const done=v!==0; if(!done){incomplete++; incNames.push(monLabel[k].replace(" monitor",""));} rows.push({label:monLabel[k],value:done?"complete":"not complete",state:done?"ok":"recheck"}); } });
+      if(incomplete>0){ parts.push(Math.min(30,incomplete*10)); bump("recheck"); detail.push(incomplete+" of "+have+" readiness monitors incomplete"); }
+      const recentClear = s.distSinceClear!=null && s.distSinceClear>=0 && s.distSinceClear<16000; // <~10 mi
+      let masking=false;
+      if(recentClear && incomplete>0){ parts.push(40); masking=true; detail.push("Codes cleared recently, monitors not yet re-run \u2014 recent repair or possible masking"); rows.push({label:"Recent code clear",value:"yes \u2014 monitors not re-run",state:"recheck"}); }
+      if(milOn) headline="Check-engine light on \u2014 would fail an emissions inspection.";
+      else if(incomplete>0) headline="Not ready for inspection \u2014 "+incNames.join(" and ")+" monitor"+(incNames.length>1?"s":"")+" not complete."+(masking?" Codes were cleared recently, so this could be a recent repair or could be masking a fault \u2014 recheck after a full drive cycle.":" Recheck after a full drive cycle.");
+      else if(have>0) headline="Inspection-ready \u2014 readiness monitors complete, no check-engine light.";
+      else headline="No OBD readiness data reported.";
+    } else if(kind==="diesel"){
+      // Aftertreatment: DEF level + DPF regen state + DPF readings (soot/NOx only if the vehicle reports them).
+      const def=CONFIG.signals.defLevel;
+      if(s.defLevel!=null){ const lv=Math.round(s.defLevel);
+        const st = s.defLevel<=def.critical?"attention":(s.defLevel<def.normal?"recheck":"ok");
+        if(st==="attention"){ parts.push(100); detail.push("DEF critically low ("+lv+"%)"); }
+        else if(st==="recheck"){ parts.push(60); detail.push("DEF low ("+lv+"%)"); }
+        bump(st); rows.push({label:"DEF level",value:lv+"%",state:st}); }
+      if(s.dpfRegen!=null){ const on=s.dpfRegen!==0; rows.push({label:"DPF regeneration",value:on?"in progress":"not active",state:"ok"}); if(on)detail.push("DPF regenerating"); }
+      if(s.regenInhibit!=null && s.regenInhibit!==0){ parts.push(40); bump("recheck"); detail.push("DPF regeneration inhibited"); rows.push({label:"DPF regen inhibited",value:"yes",state:"recheck"}); }
+      const dpf=signalBadness(s.dpfSoot,CONFIG.signals.dpfSoot.normal,CONFIG.signals.dpfSoot.critical,"high");
+      if(dpf!=null){ const st=dpf>=100?"attention":dpf>=60?"recheck":"ok"; parts.push(dpf); if(st!=="ok")bump(st); detail.push("DPF soot load "+Math.round(s.dpfSoot)+"%"); rows.push({label:"DPF soot load",value:Math.round(s.dpfSoot)+"%",state:st}); }
+      if(s.dpfIntakePress!=null) rows.push({label:"DPF intake pressure",value:kpaToPsi(s.dpfIntakePress)+" psi",state:"ok"});
+      if(s.dpfIntakeTemp!=null) rows.push({label:"DPF intake temp",value:cToF(s.dpfIntakeTemp)+"\u00b0F",state:"ok"});
+      if(s.dpfOutletTemp!=null) rows.push({label:"DPF outlet temp",value:cToF(s.dpfOutletTemp)+"\u00b0F",state:"ok"});
+      if(s.noxIn!=null&&s.noxOut!=null&&s.noxIn>0){ const ratio=s.noxOut/s.noxIn; const b=ratio<=0.3?0:ratio>=0.8?100:clamp((ratio-0.3)/0.5*100,0,100); const st=b>=60?"recheck":"ok"; parts.push(b); if(st!=="ok")bump(st); detail.push("NOx out/in ratio "+ratio.toFixed(2)+" (SCR)"); rows.push({label:"SCR (NOx out/in)",value:ratio.toFixed(2),state:st}); }
+      if(s.defLevel!=null && s.defLevel<=def.critical) headline="DEF critically low \u2014 engine derate likely; refill now.";
+      else if(s.defLevel!=null && s.defLevel<def.normal) headline="DEF low \u2014 refill soon.";
+      else if(s.regenInhibit!=null && s.regenInhibit!==0) headline="DPF regeneration is inhibited \u2014 soot can build up; clear the inhibit when safe.";
+      else if(dpf!=null && dpf>=100) headline="DPF soot load very high \u2014 service the particulate filter.";
+      else headline="Aftertreatment normal"+(s.dpfRegen!=null&&s.dpfRegen!==0?" \u2014 DPF regenerating now.":".");
+    } else {
+      return { score:null, disp:"No data", state:"none", kind:"none", headline:"No emissions data reported.", rows:[], detail:[] };
+    }
+
+    const score = parts.length?Math.max.apply(null,parts):0;
+    const disp = worstState==="attention"?"Attention":worstState==="recheck"?"Recheck":"OK";
+    return { score, disp, state:worstState, kind, headline, rows, detail };
   }
 
   // CO2: windowed per-engine-hour. delta fuel / delta hours over the status window;
@@ -411,13 +446,11 @@ geotab.addin.vehicleHealth = () => {
     { id:"Unknown",                 short:"Unknown",              cls:"x", icon:"dash",     desc:"Could not compute" },
   ];
   const ACTIONS_EM = [
-    { id:"Service emissions system",   short:"Service emissions",   cls:"r", icon:"alert",    desc:"Check-engine light on or aftertreatment fault" },
-    { id:"Check SCR / aftertreatment", short:"Check SCR",           cls:"o", icon:"wrench",   desc:"Aftertreatment efficiency looks low" },
-    { id:"Recheck after drive cycle",  short:"Recheck",             cls:"a", icon:"calendar", desc:"Monitors not complete \u2014 recheck after a drive" },
-    { id:"Monitor",                    short:"Monitor",             cls:"t", icon:"pulse",    desc:"Minor emissions signals" },
-    { id:"OK",                         short:"OK",                  cls:"g", icon:"check",    desc:"No emissions issues detected" },
-    { id:"No data",                    short:"No data",             cls:"x", icon:"dash",     desc:"No emissions data reporting" },
-    { id:"Unknown",                    short:"Unknown",             cls:"x", icon:"dash",     desc:"Could not compute" },
+    { id:"Attention", short:"Attention", cls:"r", icon:"alert",    desc:"Would fail inspection, or DEF critically low" },
+    { id:"Recheck",   short:"Recheck",   cls:"a", icon:"calendar", desc:"Monitors not complete, or aftertreatment needs a look" },
+    { id:"OK",        short:"OK",        cls:"g", icon:"check",    desc:"Inspection-ready / aftertreatment normal" },
+    { id:"No data",   short:"No data",   cls:"x", icon:"dash",     desc:"No emissions data reporting" },
+    { id:"Unknown",   short:"Unknown",   cls:"x", icon:"dash",     desc:"Could not compute" },
   ];
   const actionsFor = () => TAB==="breakdown" ? ACTIONS_BD : ACTIONS_EM;
   const actionMeta = id => (actionsFor().find(a=>a.id===id)) || { id, short:id, cls:"x", icon:"dash", desc:"" };
@@ -430,10 +463,9 @@ geotab.addin.vehicleHealth = () => {
     { id:"healthy", label:"Healthy",         cls:"g", set:["OK"] },
   ];
   const KPI_EM = [
-    { id:"service", label:"Service",  cls:"r", set:["Service emissions system","Check SCR / aftertreatment"] },
-    { id:"recheck", label:"Recheck",  cls:"a", set:["Recheck after drive cycle"] },
-    { id:"monitor", label:"Monitor",  cls:"t", set:["Monitor"] },
-    { id:"healthy", label:"Healthy",  cls:"g", set:["OK"] },
+    { id:"attention", label:"Attention", cls:"r", set:["Attention"] },
+    { id:"recheck",   label:"Recheck",   cls:"a", set:["Recheck"] },
+    { id:"healthy",   label:"OK",        cls:"g", set:["OK"] },
   ];
   const kpisFor = () => TAB==="breakdown" ? KPI_BD : KPI_EM;
 
@@ -516,6 +548,17 @@ geotab.addin.vehicleHealth = () => {
   const bandColor = v => v==null?"#98A2B3" : v>=90?"#B42318" : v>=75?"#B54708" : v>=60?"#854A0E" : v>=40?"#107569" : "#2D6A2F";
   function normGroups(state){ const raw=(state&&state.getGroupFilter&&state.getGroupFilter())||[]; return raw.map(g=>typeof g==="string"?{id:g}:g).filter(g=>g&&g.id); }
   const resolveId = kw => { const k=lc(kw); for(const id in NAME_BY_ID) if(lc(NAME_BY_ID[id]).indexOf(k)>-1) return id; return null; };
+  // Full Diagnostic id->name catalog, fetched once per page session. Needed so keyword-only signals
+  // (DEF, DPF temps/pressure/regen, oil pressure, etc.) resolve even when they never appear as a fault.
+  let DIAG_CAT=null;
+  function ensureDiagCatalog(done){
+    if(DIAG_CAT){ NAME_BY_ID=DIAG_CAT; done(); return; }
+    setStatus("Loading diagnostic catalog\u2026");
+    API.call("Get",{typeName:"Diagnostic",resultsLimit:50000}, diags=>{
+      const m={}; (diags||[]).forEach(d=>{ if(d&&d.id)m[d.id]=d.name||""; });
+      DIAG_CAT=m; NAME_BY_ID=m; done();
+    }, fail);
+  }
 
   // ---- vehicle identity from VIN (year deterministic; make from manufacturer prefix) ----
   const WMI={ "1FA":"Ford","1FB":"Ford","1FC":"Ford","1FD":"Ford","1FT":"Ford","1FM":"Ford","2FA":"Ford","2FM":"Ford","2FT":"Ford","3FA":"Ford","NM0":"Ford",
@@ -567,7 +610,7 @@ geotab.addin.vehicleHealth = () => {
   const dispOf  = r => TAB==="breakdown" ? r.disp : r.em.disp;
   const scoreOf = r => TAB==="breakdown" ? r.score : (r.em?r.em.score:null);
   const NEED = new Set(["Remove from service","Service now","Schedule diagnostic","Watch \u2013 intermittent",
-                        "Service emissions system","Check SCR / aftertreatment","Recheck after drive cycle"]);
+                        "Attention","Recheck"]);
   function actionNeededCount(){ return COMPUTED.filter(r=>NEED.has(dispOf(r))).length; }
   function lockRefresh(on){ const b=el("vh-refresh"); if(b)b.disabled=!!on; }
 
@@ -660,7 +703,7 @@ geotab.addin.vehicleHealth = () => {
             const dsi=dsiByDev[dev.id]||null;
             const geotabRisk = (s.predictedRisk!=null && !isNaN(s.predictedRisk)) ? s.predictedRisk : null;
             let score,disp,em,co2,noDataReason=null;
-            if(!hasData){ score=null; disp="No data"; em={score:null,disp:"No data",detail:[]}; co2=null;
+            if(!hasData){ score=null; disp="No data"; em={score:null,disp:"No data",state:"none",kind:"none",headline:"No emissions data reported.",rows:[],detail:[]}; co2=null;
               const stale = dsi && dsi.lastComm && (Date.now()-new Date(dsi.lastComm).getTime())>SETTINGS.staleHours*3600e3;
               noDataReason = (dsi && (dsi.comm===false || stale)) ? ("Offline"+(dsi.lastComm?" \u00b7 "+timeSince(dsi.lastComm):"")) : "No engine data";
             } else { score=combine(terms); disp=score==null?"Unknown":disposition(dtc.items,terms); em=emissionsHealth(s); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackSlowDays); }
@@ -698,9 +741,7 @@ geotab.addin.vehicleHealth = () => {
         }, fail);
       };
 
-      NAME_BY_ID={};
-      if(faultDiagIds.length){ API.call("Get",{typeName:"Diagnostic",search:{ids:faultDiagIds}}, diags=>{ (diags||[]).forEach(d=>{NAME_BY_ID[d.id]=d.name;}); proceed(); }, fail); }
-      else proceed();
+      ensureDiagCatalog(proceed);
     }, fail);
   }
   function fail(err){ LOADING=false; lockRefresh(false); setStatus("Error: "+(err&&err.message?err.message:String(err))); showError(); announce("Error loading data"); console.error("[VehicleHealth]",err); }
@@ -1018,15 +1059,32 @@ geotab.addin.vehicleHealth = () => {
       +(ns?'<div class="vh-dsub">Notes</div>'+ns:'')+'</section>';
   }
   function emissionsSection(r){
-    const em=r.em, score=em.score==null?'\u2014':Math.round(em.score);
-    const lines=(em.detail&&em.detail.length)?'<ul class="vh-notes">'+em.detail.map(d=>'<li>'+esc(d)+'</li>').join("")+'</ul>':'<p class="vh-muted">No emissions issues detected from available signals.</p>';
+    const em=r.em||{}; const kind=em.kind, state=em.state||"none";
+    const fg={ok:"#067647",recheck:"#B54708",attention:"#B42318",none:"#475467"};
+    const bg={ok:"#ECFDF3",recheck:"#FEF0C7",attention:"#FEE4E2",none:"#F2F4F7"};
+    const hpill='<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;background:'+(bg[state]||bg.none)+';color:'+(fg[state]||fg.none)+'">'+esc(em.disp||"No data")+'</span>';
+    const head=em.headline?'<div class="vh-callout" style="border-left:3px solid '+(fg[state]||fg.none)+';margin-bottom:12px">'+esc(em.headline)+'</div>':'';
+    let rows=(em.rows||[]).slice();
+    if(kind==="gas"){
+      const catFault=(r.items||[]).some(i=>/catalyst.*efficiency below threshold/i.test(i.name||""));
+      const catMon=rows.find(x=>/catalyst monitor/i.test(x.label||""));
+      let cv,cs;
+      if(catFault){ cv="efficiency fault (P0420/P0430)"; cs="attention"; }
+      else if(catMon && /not complete/i.test(catMon.value)){ cv="monitor not yet complete"; cs="recheck"; }
+      else { cv="no efficiency fault detected"; cs="ok"; }
+      rows.push({label:"Catalytic converter",value:cv,state:cs});
+    }
+    const dot=st=>'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+(fg[st]||"#98A2B3")+';margin-right:8px;vertical-align:middle"></span>';
+    const strip=rows.length
+      ? '<div style="margin-top:4px">'+rows.map(x=>'<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #F2F4F7"><span style="color:#344054">'+dot(x.state)+esc(x.label)+'</span><span style="color:#475467;font-weight:500">'+esc(x.value)+'</span></div>').join("")+'</div>'
+      : '<p class="vh-muted">No emissions signals reported.</p>';
     let carbon='';
     if(r.co2){ const ph=r.co2.perHour!=null?('<br><b>~'+r.co2.perHour.toFixed(1)+' kg CO\u2082 / engine-hour</b> (last '+r.co2.perHourDays+' days)'):'';
       carbon='<div class="vh-callout"><b>'+fmtInt(r.co2.totalKg)+' kg</b> total \u00b7 <b>'+fmtInt(r.co2.idleKg)+' kg</b> from idling'+(r.co2.idleWaste?' \u26a0 high idle waste':'')+ph
         +'<br><span class="vh-muted">Fuel-derived estimate \u2014 use the Geotab Sustainability Center for certified figures.</span></div>'; }
-    return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Emissions health</h4><div class="vh-dsec-meta">'+pill(em.disp)
-      +'<span class="vh-dscore" style="color:'+bandColor(em.score)+'">'+score+'</span></div></div>'
-      +'<div class="vh-dsub">Findings</div>'+lines
+    return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Emissions health</h4><div class="vh-dsec-meta">'+hpill+'</div></div>'
+      +head
+      +'<div class="vh-dsub">Status</div>'+strip
       +(carbon?'<div class="vh-dsub">Carbon estimate</div>'+carbon:'')+'</section>';
   }
 
