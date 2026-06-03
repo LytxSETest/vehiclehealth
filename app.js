@@ -13,6 +13,7 @@ geotab.addin.vehicleHealth = () => {
     deviceControllerId:   "ControllerGoDeviceId",
     stateMultiplier: { Active:1.0, Pending:0.6, Inactive:0.2 },
     riskServiceNow: 40,
+    signalActionBand: 75,  // a live temp/pressure reading at/above this (near its critical limit) bumps the action to "Schedule"
     safetySystemKeywords: ["abs","brake","wheel speed","steering","stability"],
     harshRuleKeywords: ["harsh","aggressive","acceleration","braking","cornering"], // fallback for custom-named rules
     harshRuleIds: ["RuleHarshBrakingId","RuleHarshCorneringId","RuleJackrabbitStartsId",
@@ -130,19 +131,19 @@ geotab.addin.vehicleHealth = () => {
     const sg=CONFIG.signals[k]; return signalBadness(s[k],sg.normal,sg.critical,sg.dir); }).filter(v=>v!=null)); }
   function pressureTerm(s){ return maxOf(["oilPressure","fuelPressure","boost"].map(k=>{
     const sg=CONFIG.signals[k]; return signalBadness(s[k],sg.normal,sg.critical,sg.dir); }).filter(v=>v!=null)); }
-  function usageTerm(s,harshCount,ctx){
-    ctx=ctx||{}; const parts=[];
+  function usageParts(s,harshCount,ctx){
+    ctx=ctx||{};
     // idle: prefer trip idle-TIME ratio (idle / (idle+drive)); fall back to fuel idle ratio
     let idleRatio=null;
     if(ctx.idleSec!=null && ctx.driveSec!=null && (ctx.idleSec+ctx.driveSec)>0) idleRatio=ctx.idleSec/(ctx.idleSec+ctx.driveSec);
     else if(s.fuelTotal!=null && s.fuelIdle!=null && s.fuelTotal>0) idleRatio=s.fuelIdle/s.fuelTotal;
-    if(idleRatio!=null){ const c=CONFIG.idleRatio;
-      parts.push(idleRatio<=c.normal?0:idleRatio>=c.critical?100:clamp((idleRatio-c.normal)/(c.critical-c.normal)*100,0,100)); }
-    // harsh: raw event count over the window (Trip still supplies the idle-time ratio above and mileage for display)
-    if(harshCount!=null){ const h=CONFIG.harshRate;
-      parts.push(harshCount<=h.normal?0:harshCount>=h.critical?100:clamp((harshCount-h.normal)/(h.critical-h.normal)*100,0,100)); }
-    return parts.length?Math.max.apply(null,parts):null;
+    const ic=CONFIG.idleRatio, hc=CONFIG.harshRate;
+    const idleBad = idleRatio==null?null:(idleRatio<=ic.normal?0:idleRatio>=ic.critical?100:clamp((idleRatio-ic.normal)/(ic.critical-ic.normal)*100,0,100));
+    const harshBad = harshCount==null?null:(harshCount<=hc.normal?0:harshCount>=hc.critical?100:clamp((harshCount-hc.normal)/(hc.critical-hc.normal)*100,0,100));
+    const vals=[idleBad,harshBad].filter(v=>v!=null);
+    return { score: vals.length?Math.max.apply(null,vals):null, idleBad, harshBad };
   }
+  function usageTerm(s,harshCount,ctx){ return usageParts(s,harshCount,ctx).score; }
   function maintTerm(s,openDefects){
     const parts=[];
     if(openDefects!=null)parts.push(openDefects<=0?0:clamp(40+(openDefects-1)*30,0,100));
@@ -160,13 +161,20 @@ geotab.addin.vehicleHealth = () => {
 
   function combine(terms){ let w=0,a=0; for(const k in CONFIG.weights){ const v=terms[k]; if(v==null)continue; w+=CONFIG.weights[k]; a+=CONFIG.weights[k]*v; } return w===0?null:a/w; }
   function band(score){ if(score==null)return ["Unknown","vhs-b-unknown"]; for(const b of CONFIG.bands) if(score>=b[0])return [b[1],b[2]]; return ["Normal","vhs-b-normal"]; }
-  function disposition(items,batteryScore){
+  function disposition(items,terms){
+    terms=terms||{};
     if(items.some(i=>i.domState==="Active"&&i.worstLamp>=100))return "Remove from service";
     if(items.some(i=>i.domState==="Active"&&(i.worstLamp>=60||(i.worstSeverity||0)>=60||(i.maxRisk||0)>=CONFIG.riskServiceNow||i.safety)))return "Service now";
     let d=items.length?"Monitor":"OK";
     if(items.some(i=>i.domState==="Pending"&&(i.worstSeverity||0)>=25)||items.some(i=>i.domState==="Active"))d="Schedule diagnostic";
     else if(items.some(i=>i.intermittent))d="Watch \u2013 intermittent";
-    if((d==="OK"||d==="Monitor")&&batteryScore!=null&&batteryScore>=60)d="Schedule diagnostic";
+    // a weak battery, or a live temp/pressure reading near its critical limit, warrants at least a scheduled check
+    if(d==="OK"||d==="Monitor"){
+      const sb=CONFIG.signalActionBand;
+      const liveSignal=(terms.T!=null&&terms.T>=sb)||(terms.P!=null&&terms.P>=sb);
+      const weakBattery=terms.B!=null&&terms.B>=60;
+      if(liveSignal||weakBattery)d="Schedule diagnostic";
+    }
     return d;
   }
 
@@ -458,7 +466,9 @@ geotab.addin.vehicleHealth = () => {
             const tp=tripByDev[dev.id]||null;
             const distanceMi = tp && tp.distM>0 ? tp.distM/1609.344 : null;
             const ctx = tp ? { distanceMi, idleSec:tp.idleSec, driveSec:tp.driveSec } : {};
-            const terms={ DTC:dtc.score, T:tempTerm(s), P:pressureTerm(s), U:usageTerm(s,harsh,ctx), M:maintTerm(s,openDef), B:batteryTerm(s,battOcc) };
+            const up=usageParts(s,harsh,ctx);
+            const terms={ DTC:dtc.score, T:tempTerm(s), P:pressureTerm(s), U:up.score, M:maintTerm(s,openDef), B:batteryTerm(s,battOcc) };
+            const usageKind = up.score==null?null:((up.harshBad||0)>=(up.idleBad||0)?"harsh":"idle");
             const hasData = b.vehicle.length||b.battery.length||Object.keys(s).length||(harsh&&harsh>0)||(openDef&&openDef>0);
             const dFuel=(s.fuelTotal!=null&&f0.fuelTotal!=null)?s.fuelTotal-f0.fuelTotal:null;
             const hk=s.engineHours!=null?"engineHours":(s.engineHoursAdj!=null?"engineHoursAdj":null);
@@ -469,7 +479,7 @@ geotab.addin.vehicleHealth = () => {
             if(!hasData){ score=null; disp="No data"; em={score:null,disp:"No data",detail:[]}; co2=null;
               const stale = dsi && dsi.lastComm && (Date.now()-new Date(dsi.lastComm).getTime())>CONFIG.staleHours*3600e3;
               noDataReason = (dsi && (dsi.comm===false || stale)) ? ("Offline"+(dsi.lastComm?" \u00b7 "+timeSince(dsi.lastComm):"")) : "No engine data";
-            } else { score=combine(terms); disp=score==null?"Unknown":disposition(dtc.items,terms.B); em=emissionsHealth(s); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackSlowDays); }
+            } else { score=combine(terms); disp=score==null?"Unknown":disposition(dtc.items,terms); em=emissionsHealth(s); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackSlowDays); }
             const gids=(dev.groups||[]).map(g=>g.id).filter(id=>id && CONFIG.rootGroupIds.indexOf(id)<0);
             const gnames=gids.map(id=>GROUP_BY_ID[id]).filter(Boolean);
             const vin=dev.vehicleIdentificationNumber||null; const vd=decodeVin(vin);
@@ -480,7 +490,7 @@ geotab.addin.vehicleHealth = () => {
               vin, year, make, model, plate:dev.licensePlate||null,
               distanceMi, geotabRisk, lastComm:dsi?dsi.lastComm:null, comm:dsi?dsi.comm:null, noDataReason,
               score, terms, disp, items:dtc.items, battOcc, deviceFaultCount:b.device.length,
-              harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, em, co2, noData:!hasData };
+              harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, usageKind, em, co2, noData:!hasData };
           });
           LOADING=false; lockRefresh(false); LAST_UPDATED=new Date(); SECTION_LIMIT={};
           renderAll();
@@ -604,9 +614,13 @@ geotab.addin.vehicleHealth = () => {
 
   // ========================= rendering: grouped list + rows =========================
   function chip(label,v){ return '<span class="vh-chip chip-'+fbClass(v)+'">'+esc(label)+' '+Math.round(v)+'</span>'; }
-  function contribHTML(terms){ const tops=topContributors(terms);
-    if(!tops.length) return '<span class="vh-chip chip-none">No active factors</span>';
-    return tops.map(t=>chip(t.label,t.v)).join(""); }
+  function contribHTML(terms){ return topContributors(terms).map(t=>chip(t.label,t.v)).join(""); }
+  function behaviorChip(r){
+    const u=r.terms&&r.terms.U;
+    if(u==null||u<40) return "";   // only flag clearly elevated behaviour; full detail lives in the drawer
+    const label = r.usageKind==="idle" ? "High idle" : "Harsh driving";
+    return '<span class="vh-chip chip-behavior" title="Driver behaviour \u2014 not a breakdown fault">'+esc(label)+'</span>';
+  }
   function scoreMini(v){ if(v==null) return '<span class="vh-score na" aria-label="no data">\u2014</span>';
     const col=bandColor(v);
     return '<span class="vh-score" aria-label="'+Math.round(v)+' of 100, lower is healthier"><b style="color:'+col+'">'+Math.round(v)+'</b>'
@@ -620,7 +634,8 @@ geotab.addin.vehicleHealth = () => {
     const head='<span class="vh-dot" style="background:'+HUE[a.cls]+'" aria-hidden="true"></span>'
       +'<span class="vh-rowname"><span class="vh-rowtop"><span class="vh-nm">'+esc(r.name)+'</span>'+dev+grp+'</span>'+sub+'</span>';
     if(TAB==="breakdown"){
-      const mid = r.noData ? '<span class="vh-chip chip-none">'+esc(r.noDataReason||"No data")+'</span>' : contribHTML(r.terms);
+      const mid = r.noData ? '<span class="vh-chip chip-none">'+esc(r.noDataReason||"No data")+'</span>'
+        : ((contribHTML(r.terms)+behaviorChip(r)) || '<span class="vh-chip chip-none">No active issues</span>');
       const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+", risk score "+(r.score==null?"no data":Math.round(r.score)+" of 100")+". Activate for details.");
       return '<div class="vh-row bd'+(r.noData?" nodata":"")+'" role="button" tabindex="0" data-id="'+esc(r.id)+'" aria-label="'+aria+'">'
         +head+'<span class="vh-contrib">'+mid+'</span>'
