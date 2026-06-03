@@ -257,6 +257,8 @@ geotab.addin.vehicleHealth = () => {
   const kpisFor = () => TAB==="breakdown" ? KPI_BD : KPI_EM;
 
   const SWATCH = { r:"#B42318", o:"#B54708", a:"#854A0E", c:"#175CD3", t:"#107569", g:"#2D6A2F", x:"#98A2B3" };
+  // Vivid hues for NON-TEXT marks (KPI accents, strip segments, row/section dots) - brighter than the AA text inks.
+  const HUE = { r:"#E0533A", o:"#EC8B47", a:"#EBBF49", c:"#3FA0F5", t:"#28BFB0", g:"#5FBF7A", x:"#B0B7C3" };
   const TERM_LABEL = { DTC:"Faults", T:"Temp", P:"Pressure", U:"Usage", M:"Maint", B:"Battery" };
 
   // Inline SVG icons (rendered inside <body>, which the add-in loader keeps). 16px, currentColor.
@@ -321,6 +323,8 @@ geotab.addin.vehicleHealth = () => {
     const hh=String(d.getHours()).padStart(2,"0"), mm=String(d.getMinutes()).padStart(2,"0");
     return "Updated "+hh+":"+mm; }
   const fbClass = v => v>=75?"r":v>=60?"o":v>=40?"a":"g";   // score-bar colour band
+  // AA-contrast text colour for a score, matching the gauge zones (green<40, teal<60, amber<75, orange<90, red).
+  const bandColor = v => v==null?"#98A2B3" : v>=90?"#B42318" : v>=75?"#B54708" : v>=60?"#854A0E" : v>=40?"#107569" : "#2D6A2F";
   function normGroups(state){ const raw=(state&&state.getGroupFilter&&state.getGroupFilter())||[]; return raw.map(g=>typeof g==="string"?{id:g}:g).filter(g=>g&&g.id); }
   const resolveId = kw => { const k=lc(kw); for(const id in NAME_BY_ID) if(lc(NAME_BY_ID[id]).indexOf(k)>-1) return id; return null; };
 
@@ -362,7 +366,7 @@ geotab.addin.vehicleHealth = () => {
   // Top risk factors for a vehicle row: named contributors instead of cryptic letter-bars.
   function topContributors(terms){
     if(!terms) return [];
-    const arr=Object.keys(terms).filter(k=>terms[k]!=null).map(k=>({k,label:TERM_LABEL[k],v:terms[k]})).sort((a,b)=>b.v-a.v);
+    const arr=Object.keys(terms).filter(k=>k!=="U" && terms[k]!=null).map(k=>({k,label:TERM_LABEL[k],v:terms[k]})).sort((a,b)=>b.v-a.v);
     const elevated=arr.filter(x=>x.v>=40).slice(0,2);
     if(elevated.length) return elevated;
     if(arr.length && arr[0].v>0) return [arr[0]];
@@ -568,7 +572,7 @@ geotab.addin.vehicleHealth = () => {
     if(LOADING){ wrap.innerHTML=""; return; }
     const total=COMPUTED.length, c=counts(), kpis=kpisFor(), need=actionNeededCount(), upd=lastUpdatedText();
     const cards=kpis.map((k,i)=>{ const n=k.set.reduce((a,d)=>a+(c[d]||0),0); const pct=total?Math.round(n/total*100):0; const sel=FILTER_ID==="kpi:"+k.id;
-      return '<button class="vh-kpi'+(sel?" sel":"")+'" data-kpi="'+k.id+'" aria-pressed="'+(sel?"true":"false")+'" title="'+esc(k.label)+' \u2014 click to filter" style="--kc:'+SWATCH[k.cls]+';animation-delay:'+(i*50)+'ms">'
+      return '<button class="vh-kpi'+(sel?" sel":"")+'" data-kpi="'+k.id+'" aria-pressed="'+(sel?"true":"false")+'" title="'+esc(k.label)+' \u2014 click to filter" style="--kc:'+HUE[k.cls]+';animation-delay:'+(i*50)+'ms">'
         +'<span class="kdot" aria-hidden="true"></span>'
         +'<span class="kl">'+esc(k.label)+'</span>'
         +'<span class="kn">'+n+'</span>'
@@ -579,13 +583,16 @@ geotab.addin.vehicleHealth = () => {
     const stripSegs=segs.concat(rem>0?[{n:rem,cls:"x",label:"No data"}]:[]).filter(s=>s.n>0);
     const stripDen=stripSegs.reduce((a,s)=>a+s.n,0)||1;
     const strip = total ? '<div class="vh-dist" role="img" aria-label="Fleet distribution by status">'
-      + stripSegs.map(s=>'<span class="vh-dist-seg" style="flex:'+s.n+';background:'+SWATCH[s.cls]+'" title="'+esc(s.label)+': '+s.n+' ('+Math.round(s.n/stripDen*100)+'%)"></span>').join("")
+      + stripSegs.map(s=>'<span class="vh-dist-seg" style="flex:'+s.n+';background:'+HUE[s.cls]+'" title="'+esc(s.label)+': '+s.n+' ('+Math.round(s.n/stripDen*100)+'%)"></span>').join("")
+      + '</div>' : "";
+    const legend = total ? '<div class="vh-distleg">'
+      + stripSegs.map(s=>'<span class="vh-distleg-item"><i style="background:'+HUE[s.cls]+'"></i>'+esc(s.label)+' <b>'+s.n+'</b></span>').join("")
       + '</div>' : "";
     wrap.innerHTML=
       '<div class="vh-overview"><div class="vh-ov-l"><b>'+need+'</b> need attention <span class="vh-ov-sep">\u00b7</span> '+total+' vehicles</div>'
       +'<div class="vh-ov-r">'+(upd?esc(upd):"")+'</div></div>'
       +'<div class="vh-kpis" role="group" aria-label="Filter vehicles by status">'+cards+'</div>'
-      +strip;
+      +strip+legend;
     wrap.querySelectorAll("[data-kpi]").forEach(b=>b.addEventListener("click",()=>{ const id=b.getAttribute("data-kpi");
       if(FILTER_ID==="kpi:"+id) setFilter("all",null);
       else { const k=kpisFor().find(x=>x.id===id); setFilter("kpi:"+id,new Set(k.set)); } }));
@@ -600,8 +607,8 @@ geotab.addin.vehicleHealth = () => {
   function contribHTML(terms){ const tops=topContributors(terms);
     if(!tops.length) return '<span class="vh-chip chip-none">No active factors</span>';
     return tops.map(t=>chip(t.label,t.v)).join(""); }
-  function scoreMini(v,cls){ if(v==null) return '<span class="vh-score na" aria-label="no data">\u2014</span>';
-    const col=SWATCH[cls]||SWATCH.x;
+  function scoreMini(v){ if(v==null) return '<span class="vh-score na" aria-label="no data">\u2014</span>';
+    const col=bandColor(v);
     return '<span class="vh-score" aria-label="'+Math.round(v)+' of 100, lower is healthier"><b style="color:'+col+'">'+Math.round(v)+'</b>'
       +'<span class="vh-track"><i style="width:'+Math.max(4,Math.round(v))+'%;background:'+col+'"></i></span></span>'; }
 
@@ -610,14 +617,14 @@ geotab.addin.vehicleHealth = () => {
     const grp=r.groupNames.length?'<span class="vh-rowgrp">'+esc(r.groupNames[0])+(r.groupNames.length>1?' +'+(r.groupNames.length-1):'')+'</span>':'';
     const subt=vehicleSubtitle(r);
     const sub=subt?'<span class="vh-rowsub">'+esc(subt)+'</span>':'';
-    const head='<span class="vh-dot" style="background:'+SWATCH[a.cls]+'" aria-hidden="true"></span>'
+    const head='<span class="vh-dot" style="background:'+HUE[a.cls]+'" aria-hidden="true"></span>'
       +'<span class="vh-rowname"><span class="vh-rowtop"><span class="vh-nm">'+esc(r.name)+'</span>'+dev+grp+'</span>'+sub+'</span>';
     if(TAB==="breakdown"){
       const mid = r.noData ? '<span class="vh-chip chip-none">'+esc(r.noDataReason||"No data")+'</span>' : contribHTML(r.terms);
       const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+", risk score "+(r.score==null?"no data":Math.round(r.score)+" of 100")+". Activate for details.");
       return '<div class="vh-row bd'+(r.noData?" nodata":"")+'" role="button" tabindex="0" data-id="'+esc(r.id)+'" aria-label="'+aria+'">'
         +head+'<span class="vh-contrib">'+mid+'</span>'
-        +'<span class="vh-scorecell">'+scoreMini(r.score,a.cls)+'</span>'
+        +'<span class="vh-scorecell">'+scoreMini(r.score)+'</span>'
         +'<span class="vh-chev" aria-hidden="true">'+svg("chevron",15)+'</span></div>';
     }
     const finding = r.noData ? (r.noDataReason||"No data") : ((r.em.detail&&r.em.detail.length)?r.em.detail[0]:(r.em.score===0?"No issues detected":"\u2014"));
@@ -652,7 +659,7 @@ geotab.addin.vehicleHealth = () => {
       html+='<div class="vh-sec'+(NEED.has(a.id)?" need":"")+'">'
         +'<button class="vh-sechead" data-sec="'+esc(a.id)+'" aria-expanded="'+(collapsed?"false":"true")+'" aria-controls="'+bodyId+'">'
           +'<span class="vh-sechev'+(collapsed?'':' open')+'" aria-hidden="true">'+svg("chevron",13)+'</span>'
-          +'<span class="vh-sicon" style="color:'+SWATCH[a.cls]+'" aria-hidden="true">'+svg(a.icon,16)+'</span>'
+          +'<span class="vh-sicon" style="color:'+HUE[a.cls]+'" aria-hidden="true">'+svg(a.icon,16)+'</span>'
           +'<span class="vh-secname">'+esc(a.short)+'</span>'
           +'<span class="vh-seccount">'+list.length+'</span>'
           +'<span class="vh-secdesc">'+esc(a.desc)+'</span>'
@@ -705,20 +712,19 @@ geotab.addin.vehicleHealth = () => {
     if(v==null) return '<div class="vh-trm na"><span class="lab">'+esc(label)+'</span><span class="tk"></span><span class="v">\u2014</span></div>';
     return '<div class="vh-trm"><span class="lab">'+esc(label)+'</span><span class="tk"><i class="fb-'+fbClass(v)+'" style="width:'+Math.max(3,Math.round(v))+'%"></i></span><span class="v">'+Math.round(v)+'</span></div>'; }
 
-  // Labeled gauge that anchors the breakdown score: 0-100 scale, banded track, marker, action-colored value.
+  // Labeled gauge that anchors the breakdown score: 0-100 scale, banded track, marker, band-coloured value.
   function riskGauge(r){
-    const am=ACTIONS_BD.find(a=>a.id===r.disp)||{cls:"x"}; const acol=SWATCH[am.cls]||SWATCH.x;
     if(r.score==null){
       return '<div class="vh-gauge nodata"><div class="vh-gauge-top"><span class="vh-gauge-num na">\u2014</span>'
         +'<span class="vh-gauge-sub">no engine data to score</span></div></div>';
     }
-    const v=Math.round(r.score), pos=clamp(v,0,100);
+    const v=Math.round(r.score), pos=clamp(v,0,100), col=bandColor(v);
     const urgent=(r.disp==="Service now"||r.disp==="Remove from service");
     const note=(urgent && v<60)
       ? '<div class="vh-gauge-note">Overall risk is '+(v<40?"low":"moderate")+'. This vehicle is flagged \u201c'+esc(r.disp)+'\u201d because of a specific active fault, not its composite score.</div>'
       : '';
     return '<div class="vh-gauge">'
-      +'<div class="vh-gauge-top"><span class="vh-gauge-num" style="color:'+acol+'">'+v+'<span class="vh-gauge-max">/100</span></span>'
+      +'<div class="vh-gauge-top"><span class="vh-gauge-num" style="color:'+col+'">'+v+'<span class="vh-gauge-max">/100</span></span>'
       +'<span class="vh-gauge-sub">breakdown-risk index \u00b7 lower is healthier</span></div>'
       +'<div class="vh-gauge-track"><span class="vh-gauge-mark" style="left:'+pos+'%"></span></div>'
       +'<div class="vh-gauge-ticks"><span>0</span><span>50</span><span>100</span></div>'
@@ -758,7 +764,7 @@ geotab.addin.vehicleHealth = () => {
       carbon='<div class="vh-callout"><b>'+fmtInt(r.co2.totalKg)+' kg</b> total \u00b7 <b>'+fmtInt(r.co2.idleKg)+' kg</b> from idling'+(r.co2.idleWaste?' \u26a0 high idle waste':'')+ph
         +'<br><span class="vh-muted">Fuel-derived estimate \u2014 use the Geotab Sustainability Center for certified figures.</span></div>'; }
     return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Emissions health</h4><div class="vh-dsec-meta">'+pill(em.disp)
-      +'<span class="vh-dscore" style="color:'+(em.score==null?"#98A2B3":SWATCH[fbClass(em.score)])+'">'+score+'</span></div></div>'
+      +'<span class="vh-dscore" style="color:'+bandColor(em.score)+'">'+score+'</span></div></div>'
       +'<div class="vh-dsub">Findings</div>'+lines
       +(carbon?'<div class="vh-dsub">Carbon estimate</div>'+carbon:'')+'</section>';
   }
