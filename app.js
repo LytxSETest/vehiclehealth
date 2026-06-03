@@ -1206,7 +1206,6 @@ geotab.addin.vehicleHealth = () => {
           +'<span class="vh-sicon" style="color:'+HUE[a.cls]+'" aria-hidden="true">'+svg(a.icon,16)+'</span>'
           +'<span class="vh-secname">'+esc(a.short)+'</span>'
           +'<span class="vh-seccount">'+list.length+'</span>'
-          +'<span class="vh-secdesc">'+esc(a.desc)+'</span>'
         +'</button>'
         +'<div class="vh-secbody" id="'+bodyId+'"'+(collapsed?' hidden':'')+'>'
           + shown.map(r=>rowHTML(r,a)).join("")
@@ -1325,7 +1324,7 @@ geotab.addin.vehicleHealth = () => {
     if(s.oilPressure!=null) out.push(readingRow("Oil pressure", s.oilPressure, CONFIG.signals.oilPressure, kpaToPsi(s.oilPressure)+" psi"));
     if(s.deviceVoltage!=null) out.push(readingRow("Battery voltage", s.deviceVoltage, CONFIG.signals.deviceVoltage, (Math.round(s.deviceVoltage*10)/10).toFixed(1)+" V"));
     if(!out.length) return "";
-    return '<div class="vh-dsub">Live readings <span class="vh-rng-key">healthy<i class="k g"></i> warning<i class="k y"></i> critical<i class="k r"></i></span></div><div class="vh-rdgs">'+out.join("")+'</div>';
+    return '<div class="vh-dsub">Live readings</div><div class="vh-rng-key">healthy<i class="k g"></i> warning<i class="k y"></i> critical<i class="k r"></i></div><div class="vh-rdgs">'+out.join("")+'</div>';
   }
   // Advisory drivability call from fault severity + critical live readings. NOT a safety certification - it leans on
   // the same signals the disposition uses, plus over-temp / loss-of-oil-pressure / DEF-derate, and is shown with a caveat.
@@ -1440,16 +1439,13 @@ geotab.addin.vehicleHealth = () => {
     const strip=rows.length
       ? '<div style="margin-top:4px">'+rows.map(x=>'<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid #F2F4F7"><span style="color:#344054">'+dot(x.state)+esc(x.label)+'</span><span style="color:#475467;font-weight:500">'+esc(x.value)+'</span></div>').join("")+'</div>'
       : '<p class="vh-muted">No emissions signals reported.</p>';
-    const defBar = (kind==="diesel" && r.sig && r.sig.defLevel!=null)
-      ? '<div class="vh-rdg" style="margin-top:10px"><div class="vh-rdg-top"><span class="vh-rdg-lab">DEF level</span><span class="vh-rdg-val">'+Math.round(r.sig.defLevel)+'%</span></div>'+rangeBar(r.sig.defLevel,CONFIG.signals.defLevel)+'</div>'
-      : '';
     let carbon='';
     if(r.co2){ const ph=r.co2.perHour!=null?('<br><b>~'+r.co2.perHour.toFixed(1)+' kg CO\u2082 / engine-hour</b> (last '+r.co2.perHourDays+' days)'):'';
       carbon='<div class="vh-callout"><b>'+fmtInt(r.co2.totalKg)+' kg</b> total \u00b7 <b>'+fmtInt(r.co2.idleKg)+' kg</b> from idling'+(r.co2.idleWaste?' \u26a0 high idle waste':'')+ph
         +'<br><span class="vh-muted">Fuel-derived estimate \u2014 use the Geotab Sustainability Center for certified figures.</span></div>'; }
     return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>Emissions health</h4><div class="vh-dsec-meta">'+hpill+'</div></div>'
       +head
-      +'<div class="vh-dsub">Status</div>'+strip+defBar
+      +'<div class="vh-dsub">Status</div>'+strip
       +(carbon?'<div class="vh-dsub">Carbon estimate</div>'+carbon:'')+'</section>';
   }
 
