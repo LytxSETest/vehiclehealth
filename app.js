@@ -1167,7 +1167,7 @@ geotab.addin.vehicleHealth = () => {
       const bars = r.noData ? '' : factorBars(r);
       const aria=esc(r.name+(subt?" ("+subt+")":"")+", action "+a.short+", risk score "+(r.score==null?"no data":Math.round(r.score)+" of 100")+(COMPARE_MODE?(csel?". Selected for compare. Activate to deselect.":". Activate to select for compare."):". Activate for details."));
       return '<div class="vh-row bd'+(r.noData?" nodata":"")+cmpCls+'" role="button" tabindex="0" data-id="'+esc(r.id)+'"'+(COMPARE_MODE?' aria-pressed="'+(csel?"true":"false")+'"':'')+' aria-label="'+aria+'">'
-        +head+'<span class="vh-contrib">'+mid+bars+'</span>'
+        +head+'<span class="vh-contrib">'+mid+'</span><span class="vh-fbarcell">'+bars+'</span>'
         +'<span class="vh-scorecell">'+scoreMini(r.score)+'</span>'
         +'<span class="vh-chev" aria-hidden="true">'+svg(csel?"check":"chevron",15)+'</span></div>';
     }
@@ -1191,7 +1191,7 @@ geotab.addin.vehicleHealth = () => {
     const byAction={}; rows.forEach(r=>{ const d=dispOf(r); (byAction[d]=byAction[d]||[]).push(r); });
     const order=actionsFor();
     const colhead = TAB==="breakdown"
-      ? '<div class="vh-colhead bd"><span></span><span>Vehicle</span><span>Top risk factors</span><span class="ralign">Risk score <span class="vh-colhint">lower = healthier</span></span><span></span></div>'
+      ? '<div class="vh-colhead bd"><span></span><span>Vehicle</span><span style="grid-column:span 2">Top risk factors</span><span class="ralign">Risk score <span class="vh-colhint">lower = healthier</span></span><span></span></div>'
       : '<div class="vh-colhead em"><span></span><span>Vehicle</span><span>Finding</span><span class="ralign">CO\u2082 (kg)</span><span></span></div>';
 
     let html=(TAB==="breakdown"?factorLegend():"")+colhead;
@@ -1201,7 +1201,7 @@ geotab.addin.vehicleHealth = () => {
       const shown=collapsed?[]:list.slice(0,limit);
       const bodyId="sec-"+TAB+"-"+a.id.replace(/[^a-z0-9]+/gi,"-").toLowerCase();
       html+='<div class="vh-sec'+(NEED.has(a.id)?" need":"")+'">'
-        +'<button class="vh-sechead" data-sec="'+esc(a.id)+'" aria-expanded="'+(collapsed?"false":"true")+'" aria-controls="'+bodyId+'">'
+        +'<button class="vh-sechead s-'+esc(a.cls)+'" data-sec="'+esc(a.id)+'" aria-expanded="'+(collapsed?"false":"true")+'" aria-controls="'+bodyId+'">'
           +'<span class="vh-sechev'+(collapsed?'':' open')+'" aria-hidden="true">'+svg("chevron",13)+'</span>'
           +'<span class="vh-sicon" style="color:'+HUE[a.cls]+'" aria-hidden="true">'+svg(a.icon,16)+'</span>'
           +'<span class="vh-secname">'+esc(a.short)+'</span>'
