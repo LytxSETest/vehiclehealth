@@ -6,7 +6,7 @@ geotab.addin.vehicleHealth = () => {
     bands: [ [90,"High risk","vhs-b-high"], [75,"Priority maint.","vhs-b-priority"],
              [60,"Schedule inspection","vhs-b-inspect"], [40,"Monitor","vhs-b-monitor"],
              [0,"Normal","vhs-b-normal"] ],
-    maxDevices: 50000, faultLookbackDays: 30, statusLookbackDays: 7, statusLookbackFastDays: 3, statusLookbackSlowDays: 30, pageSize: 25,
+    maxDevices: 50000, faultLookbackDays: 30, statusLookbackDays: 7, statusLookbackFastDays: 1, statusLookbackSlowDays: 30, pageSize: 25,
     faultLimit: 50000, exceptionLimit: 50000, dvirLimit: 10000, ruleLimit: 2000, statusLimit: 500,
     batteryFaultKeywords: ["battery","low voltage"],
     deviceFaultKeywords:  ["device","restarted","power was removed","gps","antenna","tamper","telematics"],
@@ -356,10 +356,24 @@ geotab.addin.vehicleHealth = () => {
 
   function combine(terms){ const W=(SETTINGS&&SETTINGS.weights)||CONFIG.weights; let w=0,a=0; for(const k in W){ const v=terms[k]; if(v==null)continue; w+=W[k]; a+=W[k]*v; } return w===0?null:a/w; }
   function band(score){ if(score==null)return ["Unknown","vhs-b-unknown"]; for(const b of CONFIG.bands) if(score>=b[0])return [b[1],b[2]]; return ["Normal","vhs-b-normal"]; }
-  function disposition(items,terms){
-    terms=terms||{};
+  // Live-reading conditions severe enough to change the operating recommendation, shared by disposition() and
+  // drivability() so the triage bucket and the drive/tow advisory can never disagree. Conservative by design:
+  // a single latest reading at/over its critical limit is enough to escalate.
+  function criticalSignals(s,kind){
+    s=s||{}; const c=CONFIG.signals;
+    const overTemp = s.coolant!=null && signalBadness(s.coolant,c.coolant.normal,c.coolant.critical,"high")>=100;
+    const lowOil   = s.oilPressure!=null && signalBadness(s.oilPressure,c.oilPressure.normal,c.oilPressure.critical,"low")>=100;
+    const defDerate= kind==="diesel" && s.defLevel!=null && s.defLevel<=c.defLevel.critical;
+    return { overTemp, lowOil, defDerate, noDrive: overTemp||lowOil };
+  }
+  function disposition(items,terms,crit){
+    terms=terms||{}; crit=crit||{};
+    // do-not-drive live conditions (over-temp / oil-pressure loss) => take out of service, regardless of fault codes
+    if(crit.noDrive) return "Remove from service";
     if(items.some(i=>i.domState==="Active"&&i.worstLamp>=100))return "Remove from service";
     if(items.some(i=>i.domState==="Active"&&(i.worstLamp>=60||(i.worstSeverity||0)>=60||(i.maxRisk||0)>=CONFIG.riskServiceNow||i.safety)))return "Service now";
+    // DEF critically low (diesel) => its own tier: prompt service to refill before a derate (still driveable)
+    if(crit.defDerate) return "Service now";
     let d=items.length?"Monitor":"OK";
     if(items.some(i=>i.domState==="Pending"&&(i.worstSeverity||0)>=25)||items.some(i=>i.domState==="Active"))d="Schedule diagnostic";
     else if(items.some(i=>i.intermittent))d="Watch \u2013 intermittent";
@@ -761,7 +775,7 @@ geotab.addin.vehicleHealth = () => {
             if(!hasData){ score=null; disp="No data"; em={score:null,disp:"No data",state:"none",kind:"none",headline:"No emissions data reported.",rows:[],detail:[]}; co2=null;
               const stale = dsi && dsi.lastComm && (Date.now()-new Date(dsi.lastComm).getTime())>SETTINGS.staleHours*3600e3;
               noDataReason = (dsi && (dsi.comm===false || stale)) ? ("Offline"+(dsi.lastComm?" \u00b7 "+timeSince(dsi.lastComm):"")) : "No engine data";
-            } else { score=combine(terms); disp=score==null?"Unknown":disposition(dtc.items,terms); em=emissionsHealth(s,dtc.items); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackSlowDays); }
+            } else { score=combine(terms); em=emissionsHealth(s,dtc.items); const crit=criticalSignals(s,em.kind); disp=score==null?"Unknown":disposition(dtc.items,terms,crit); co2=co2Estimate(s,dFuel,dHours,CONFIG.statusLookbackSlowDays); }
             const gids=(dev.groups||[]).map(g=>g.id).filter(id=>id && CONFIG.rootGroupIds.indexOf(id)<0);
             const gnames=gids.map(id=>GROUP_BY_ID[id]).filter(Boolean);
             const vin=dev.vehicleIdentificationNumber||null; const vd=decodeVin(vin);
@@ -789,7 +803,7 @@ geotab.addin.vehicleHealth = () => {
           let sigTrunc=false;
           results.forEach((rows,i)=>{ const k=active[i]; if(!rows)return;
             if(rows.length>=CONFIG.statusLimitPerDiagnostic)sigTrunc=true;
-            rows.forEach(rec=>{ const dv=rec.device&&rec.device.id; if(!dv||!idSet.has(dv))return; const t=new Date(rec.dateTime).getTime();
+            rows.forEach(rec=>{ const dv=rec.device&&rec.device.id; if(!dv||!idSet.has(dv))return; const t=rec.dateTime; if(!t)return;
               const lT=(latestT[dv]=latestT[dv]||{}); if(lT[k]==null||t>lT[k]){ (latestBy[dv]=latestBy[dv]||{})[k]=rec.data; lT[k]=t; }
               const fT=(firstT[dv]=firstT[dv]||{}); if(fT[k]==null||t<fT[k]){ (firstBy[dv]=firstBy[dv]||{})[k]=rec.data; fT[k]=t; }
             });
@@ -891,12 +905,15 @@ geotab.addin.vehicleHealth = () => {
     const wrap=el("vh-summary"); if(!wrap)return;
     if(LOADING){ wrap.innerHTML=""; return; }
     const base=scopeExcept("disposition"); const total=base.length, c=countsOver(base), kpis=kpisFor(), need=base.filter(r=>NEED.has(dispOf(r))).length, upd=lastUpdatedText();
+    const noDrive=base.filter(r=>!r.noData && drivability(r).key==="tow").length;
     const cards=kpis.map((k,i)=>{ const n=k.set.reduce((a,d)=>a+(c[d]||0),0); const pct=total?Math.round(n/total*100):0; const sel=FILTER_ID==="kpi:"+k.id;
       return '<button class="vh-kpi'+(sel?" sel":"")+'" data-kpi="'+k.id+'" aria-pressed="'+(sel?"true":"false")+'" title="'+esc(k.label)+' \u2014 click to filter" style="--kc:'+HUE[k.cls]+';animation-delay:'+(i*50)+'ms">'
         +'<span class="kdot" aria-hidden="true"></span>'
         +'<span class="kl">'+esc(k.label)+'</span>'
         +'<span class="kn">'+n+'</span>'
-        +'<span class="kp"><b>'+pct+'%</b> of fleet</span></button>'; }).join("");
+        +'<span class="kp"><b>'+pct+'%</b> of fleet</span>'
+        +(k.id==="urgent"&&noDrive>0?'<span class="kdnd">\u26a0 '+noDrive+' do not drive</span>':'')
+        +'</button>'; }).join("");
     const segs=kpis.map(k=>({ n:k.set.reduce((a,d)=>a+(c[d]||0),0), cls:k.cls, label:k.label }));
     const kpiSum=segs.reduce((a,s)=>a+s.n,0);
     const rem=Math.max(0,total-kpiSum);
@@ -1159,8 +1176,10 @@ geotab.addin.vehicleHealth = () => {
     const sub=subt?'<span class="vh-rowsub">'+esc(subt)+'</span>':'';
     const csel = COMPARE_MODE && COMPARE_SET.indexOf(r.id)>-1;
     const cmpCls = (COMPARE_MODE?" cmp":"")+(csel?" sel":"");
+    const dr=drivability(r);
+    const dnd=(!r.noData && dr.key==="tow")?'<span class="vh-dnd" title="'+esc(dr.label+(dr.why?" \u2014 "+dr.why:""))+'">\u26a0 Do not drive</span>':'';
     const head='<span class="vh-dot" style="background:'+HUE[a.cls]+'" aria-hidden="true"></span>'
-      +'<span class="vh-rowname"><span class="vh-rowtop"><span class="vh-nm">'+esc(r.name)+'</span>'+dev+grp+'</span>'+sub+'</span>';
+      +'<span class="vh-rowname"><span class="vh-rowtop"><span class="vh-nm">'+esc(r.name)+'</span>'+dnd+dev+grp+'</span>'+sub+'</span>';
     if(TAB==="breakdown"){
       const mid = r.noData ? '<span class="vh-chip chip-none">'+esc(r.noDataReason||"No data")+'</span>'
         : ((contribHTML(r)+behaviorChip(r)) || '<span class="vh-chip chip-none">No active issues</span>');
@@ -1265,6 +1284,10 @@ geotab.addin.vehicleHealth = () => {
     const v=Math.round(r.score);
     const floor={ "Remove from service":60, "Service now":60, "Schedule diagnostic":40 }[r.disp];
     if(floor==null || v>=floor) return "";   // action matches the score - nothing to reconcile
+    const crit=criticalSignals(r.sig, r.em && r.em.kind);
+    if(crit.overTemp)  return "a critical engine temperature \u2014 do not drive";
+    if(crit.lowOil)    return "a critical loss of oil pressure \u2014 do not drive";
+    if(crit.defDerate) return "DEF critically low \u2014 refill before derate";
     const active=(r.items||[]).filter(i=>i.domState==="Active").sort((a,b)=>(b.contribution||0)-(a.contribution||0));
     const af=active[0];
     if(af && (af.worstLamp>=60 || (af.worstSeverity||0)>=60 || (af.maxRisk||0)>=CONFIG.riskServiceNow || af.safety))
@@ -1330,14 +1353,12 @@ geotab.addin.vehicleHealth = () => {
   // the same signals the disposition uses, plus over-temp / loss-of-oil-pressure / DEF-derate, and is shown with a caveat.
   function drivability(r){
     if(r.noData) return {key:"unknown", label:"No data", tone:"none"};
-    const s=r.sig||{};
-    const overTemp = s.coolant!=null && signalBadness(s.coolant,CONFIG.signals.coolant.normal,CONFIG.signals.coolant.critical,"high")>=100;
-    const lowOil   = s.oilPressure!=null && signalBadness(s.oilPressure,CONFIG.signals.oilPressure.normal,CONFIG.signals.oilPressure.critical,"low")>=100;
-    const defDerate= r.em && r.em.kind==="diesel" && s.defLevel!=null && s.defLevel<=CONFIG.signals.defLevel.critical;
-    if(r.disp==="Remove from service" || overTemp || lowOil || defDerate){
-      const why = overTemp?"engine over-temperature":lowOil?"loss of oil pressure":defDerate?"DEF critically low (derate likely)":"a critical active fault";
+    const crit=criticalSignals(r.sig, r.em && r.em.kind);
+    if(r.disp==="Remove from service" || crit.noDrive){
+      const why = crit.overTemp?"engine over-temperature":crit.lowOil?"loss of oil pressure":"a critical active fault";
       return {key:"tow", label:"Do not drive \u2014 tow", tone:"attention", why};
     }
+    if(crit.defDerate) return {key:"def", label:"Service now \u2014 refill DEF", tone:"recheck", why:"DEF critically low \u2014 refill to avoid an engine derate"};
     if(r.disp==="Service now") return {key:"soon", label:"Driveable \u2014 service promptly", tone:"recheck"};
     return {key:"ok", label:"OK to operate", tone:"ok"};
   }
@@ -1451,6 +1472,30 @@ geotab.addin.vehicleHealth = () => {
 
   let DRAWER_TRAP=null;
   function focusables(c){ return Array.prototype.slice.call(c.querySelectorAll('button,[href],input,select,textarea,[tabindex]')).filter(e=>!e.disabled && e.tabIndex!==-1 && e.offsetParent!==null); }
+  function notifySummary(r){
+    const d=drivability(r), L=[];
+    L.push("Vehicle: "+r.name);
+    if(r.groupNames&&r.groupNames.length)L.push("Group: "+r.groupNames.join(", "));
+    L.push("Recommended action: "+r.disp);
+    L.push("Drive status: "+d.label.replace(/\u2014/g,"-")+(d.why?" - "+d.why:""));
+    if(r.score!=null)L.push("Breakdown risk: "+Math.round(r.score)+"/100 (lower is healthier)");
+    if(r.lastComm)L.push("Last reported: "+timeSince(r.lastComm)+" ago");
+    L.push("");
+    L.push("Advisory only, based on reported telematics - confirm with a qualified technician. Sent from Lytx+ Vehicle Health.");
+    return L.join("\n");
+  }
+  function notifyMailto(r){ return "mailto:?subject="+encodeURIComponent("Vehicle health - "+r.name+": "+drivability(r).label.replace(/\u2014/g,"-"))+"&body="+encodeURIComponent(notifySummary(r)); }
+  function gotoRules(){ try{ if(STATE && typeof STATE.gotoPage==="function") STATE.gotoPage("rules"); }catch(e){} }
+  function copyText(txt,btn){ const done=()=>{ if(btn){ const o=btn.getAttribute("data-lab")||"Copy"; btn.textContent="Copied \u2713"; setTimeout(()=>{ btn.textContent=o; },1500); } };
+    try{ if(typeof navigator!=="undefined" && navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).then(done,function(){}); return; } }catch(e){}
+    try{ const ta=document.createElement("textarea"); ta.value=txt; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); done(); }catch(e){} }
+  function drawerActions(r){
+    return '<div class="vh-dact">'
+      +'<a class="vh-actbtn vh-actbtn-primary" href="'+notifyMailto(r)+'">Notify by email</a>'
+      +'<button class="vh-actbtn" type="button" id="vh-act-copy" data-lab="Copy summary">Copy summary</button>'
+      +'<button class="vh-actbtn" type="button" id="vh-act-rule">Set up alert in Geotab</button>'
+      +'</div><div class="vh-dact-note">Set up a rule in Geotab to be alerted automatically when a vehicle crosses a limit (e.g. engine coolant temperature).</div>';
+  }
   function drawerHTML(r){
     const grp=r.groupNames.length?esc(r.groupNames.join(" \u00b7 ")):"";
     const idbits=[]; const ym=vehicleSubtitle(r); if(ym)idbits.push(esc(ym)); if(r.plate)idbits.push("Plate "+esc(r.plate)); if(r.vin)idbits.push("VIN "+esc(r.vin));
@@ -1463,14 +1508,19 @@ geotab.addin.vehicleHealth = () => {
     const sub=(grp?'<span class="vh-dgrp">'+grp+'</span>':'')+idline+detline+seenline;
     return '<div class="vh-dhead"><div class="vh-dhead-row"><div><h3 id="vh-dtitle">'+esc(r.name)+'</h3>'+sub+'</div>'
       +'<button class="vh-x" id="vh-dx" aria-label="Close details">'+svg("close",16)+'</button></div></div>'
-      +'<div class="vh-dbody">'+drivabilityBanner(r)+profileSection(r)+breakdownSection(r)+benchmarkSection(r)+emissionsSection(r)+'</div>';
+      +'<div class="vh-dbody">'+drivabilityBanner(r)+drawerActions(r)+profileSection(r)+breakdownSection(r)+benchmarkSection(r)+emissionsSection(r)+'</div>';
   }
-  function refreshDrawerBody(r){ const d=el("vh-drawer"); if(!d)return; d.innerHTML=drawerHTML(r); const dx=el("vh-dx"); if(dx)dx.addEventListener("click",closeDrawer); }
+  function bindDrawer(){
+    const dx=el("vh-dx"); if(dx)dx.addEventListener("click",closeDrawer);
+    const cp=el("vh-act-copy"); if(cp)cp.addEventListener("click",()=>{ const r=COMPUTED.find(x=>x.id===CURRENT_DRAWER_ID); if(r)copyText(notifySummary(r),cp); });
+    const rl=el("vh-act-rule"); if(rl)rl.addEventListener("click",gotoRules);
+  }
+  function refreshDrawerBody(r){ const d=el("vh-drawer"); if(!d)return; d.innerHTML=drawerHTML(r); bindDrawer(); }
   function openDrawer(id,fromEl){
     const r=COMPUTED.find(x=>x.id===id); if(!r)return;
     LAST_FOCUS=fromEl||document.activeElement; CURRENT_DRAWER_ID=id;
     el("vh-drawer").innerHTML=drawerHTML(r);
-    const dx=el("vh-dx"); if(dx)dx.addEventListener("click",closeDrawer);
+    bindDrawer(); const dx=el("vh-dx");
     const d=el("vh-drawer"), sc=el("vh-scrim");
     d.classList.add("on"); if(sc)sc.classList.add("on"); d.setAttribute("aria-hidden","false");
     DRAWER_TRAP=function(e){ if(e.key!=="Tab")return; const f=focusables(d); if(!f.length)return; const first=f[0],last=f[f.length-1];
