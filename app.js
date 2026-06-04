@@ -201,7 +201,7 @@ geotab.addin.vehicleHealth = () => {
     const idleBad = idleRatio==null?null:(idleRatio<=ic.normal?0:idleRatio>=ic.critical?100:clamp((idleRatio-ic.normal)/(ic.critical-ic.normal)*100,0,100));
     const harshBad = harshCount==null?null:(harshCount<=hc.normal?0:harshCount>=hc.critical?100:clamp((harshCount-hc.normal)/(hc.critical-hc.normal)*100,0,100));
     const vals=[idleBad,harshBad].filter(v=>v!=null);
-    return { score: vals.length?Math.max.apply(null,vals):null, idleBad, harshBad };
+    return { score: vals.length?Math.max.apply(null,vals):null, idleBad, harshBad, idleRatio };
   }
   function usageTerm(s,harshCount,ctx){ return usageParts(s,harshCount,ctx).score; }
   function maintTerm(s,openDefects){
@@ -542,6 +542,9 @@ geotab.addin.vehicleHealth = () => {
   // Set of selected keys (empty = unconstrained); chips within a facet OR together. factor/band are breakdown-only.
   let FACETS = { factor:new Set(), band:new Set(), fuel:new Set(), group:new Set() };
   let FILTERS_OPEN = false;
+  let GDD_OPEN = false;        // vehicle-group dropdown expanded
+  let GDD_SEARCH = "";         // search text inside the group dropdown
+  let GDD_DOC_BOUND = false;   // outside-click handler bound once
   // Side-by-side vehicle compare: a selection set (max 4) populated by tapping rows while compare mode is on.
   let COMPARE_MODE = false, COMPARE_SET = [];
   const COMPARE_MAX = 4;
@@ -786,7 +789,9 @@ geotab.addin.vehicleHealth = () => {
               vin, year, make, model, plate:dev.licensePlate||null,
               distanceMi, geotabRisk, lastComm:dsi?dsi.lastComm:null, comm:dsi?dsi.comm:null, noDataReason,
               score, terms, detail, disp, items:dtc.items, battOcc, deviceFaultCount:b.device.length,
-              harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, usageKind, em, co2, noData:!hasData, sig:s };
+              harsh:harshByDev[dev.id]||0, openDefects:defectsByDev[dev.id]||0, usageKind,
+              idleRatio: up.idleRatio, idleSec: (tp?tp.idleSec:null), driveSec: (tp?tp.driveSec:null),
+              em, co2, noData:!hasData, sig:s };
           });
           LOADING=false; lockRefresh(false); LAST_UPDATED=new Date(); SECTION_LIMIT={};
           renderAll();
@@ -972,6 +977,26 @@ geotab.addin.vehicleHealth = () => {
         return '<button class="vh-fchip'+(on?" on":"")+'" type="button" data-facet="'+esc(facet)+'" data-key="'+esc(c.key)+'" aria-pressed="'+(on?"true":"false")+'">'+esc(c.label)+(c.n!=null?' <b>'+c.n+'</b>':'')+'</button>'; }).join("")
       + '</div></div>';
   }
+  // Vehicle-group facet rendered as a multi-select dropdown (collapses a long group list to one control).
+  function groupDropdown(chips){
+    const sel=FACETS.group, q=(GDD_SEARCH||"").toLowerCase();
+    const label = sel.size===0 ? "All groups" : sel.size+" group"+(sel.size>1?"s":"")+" selected";
+    const opts = chips.map(c=>{ const on=sel.has(c.key), m=!q||c.label.toLowerCase().indexOf(q)>-1;
+      return '<label class="vh-gdd-opt'+(on?" on":"")+'"'+(m?"":' style="display:none"')+'><input type="checkbox" data-gkey="'+esc(c.key)+'"'+(on?" checked":"")+'><span class="vh-gdd-optname">'+esc(c.label)+'</span><span class="vh-gdd-optn">'+c.n+'</span></label>'; }).join("");
+    const anyShown = chips.some(c=>!q||c.label.toLowerCase().indexOf(q)>-1);
+    return '<div class="vh-fgrp"><div class="vh-fgrp-h">Vehicle group</div>'
+      +'<div class="vh-gdd'+(GDD_OPEN?" open":"")+'">'
+      +'<button class="vh-gdd-btn'+(sel.size?" hassel":"")+'" type="button" id="vh-gdd-btn" aria-haspopup="true" aria-expanded="'+(GDD_OPEN?"true":"false")+'">'
+        +'<span class="vh-gdd-label">'+esc(label)+'</span><span class="vh-gdd-caret" aria-hidden="true">\u25be</span></button>'
+      +'<div class="vh-gdd-panel"'+(GDD_OPEN?"":" hidden")+'>'
+        +'<input type="text" class="vh-gdd-search" id="vh-gdd-search" placeholder="Search groups\u2026" value="'+esc(GDD_SEARCH||"")+'" autocomplete="off">'
+        +'<div class="vh-gdd-list">'+opts+'<div class="vh-gdd-empty"'+(anyShown?' hidden':'')+'>No matching groups</div></div>'
+        +(sel.size?'<div class="vh-gdd-foot"><button class="vh-gdd-clear" type="button">Clear selection</button></div>':'')
+      +'</div></div></div>';
+  }
+  function filterGddList(scope,q){ q=(q||"").toLowerCase(); let any=false;
+    scope.querySelectorAll(".vh-gdd-opt").forEach(o=>{ const nm=(o.querySelector(".vh-gdd-optname")||{}).textContent||""; const m=!q||nm.toLowerCase().indexOf(q)>-1; o.style.display=m?"":"none"; if(m)any=true; });
+    const e=scope.querySelector(".vh-gdd-empty"); if(e)e.hidden=any; }
   function renderFilters(){
     const panel=el("vh-filters"), btn=el("vh-filters-btn"); if(!panel)return;
     const n=activeFacetChips(), badge=el("vh-fbadge");
@@ -984,7 +1009,7 @@ geotab.addin.vehicleHealth = () => {
       const rb=scopeExcept("band"); groups += facetGroup("Score band","band", BAND_FACET.map(o=>({key:o[0],label:o[1],n:bandCount(o[0],rb)})).filter(c=>c.n>0), "The 0\u2013100 risk index. Separate from the action filters above \u2014 a vehicle with a low score can still be flagged for service.");
     }
     const ru=scopeExcept("fuel"); groups += facetGroup("Fuel","fuel", FUEL_FACET.map(o=>({key:o[0],label:o[1],n:fuelCount(o[0],ru)})).filter(c=>c.n>0));
-    const rg=scopeExcept("group"); groups += facetGroup("Vehicle group","group", groupChips(rg));
+    const rg=scopeExcept("group"); const gchips=groupChips(rg); if(gchips.length) groups += groupDropdown(gchips);
     panel.innerHTML='<div class="vh-fpanel-in">'+(groups||'<div class="vh-fgrp-h">No filterable attributes in the current data.</div>')
       +'<div class="vh-fpanel-foot"><button class="vh-btn vh-btn-ghost vh-fclear" type="button"'+(anyFacetActive()?"":" disabled")+'>Clear filters</button>'
       +'<span class="vh-fpanel-msg">'+filteredRows().length+' of '+COMPUTED.length+' vehicles</span></div></div>';
@@ -992,6 +1017,16 @@ geotab.addin.vehicleHealth = () => {
     if(btn)btn.setAttribute("aria-expanded", FILTERS_OPEN?"true":"false");
     panel.querySelectorAll("[data-facet]").forEach(b=>b.addEventListener("click",()=>toggleFacet(b.getAttribute("data-facet"), b.getAttribute("data-key"))));
     const clr=panel.querySelector(".vh-fclear"); if(clr)clr.addEventListener("click",clearFacets);
+    const gbtn=panel.querySelector("#vh-gdd-btn");
+    if(gbtn) gbtn.addEventListener("click",function(e){ e.stopPropagation(); GDD_OPEN=!GDD_OPEN;
+      const pn=panel.querySelector(".vh-gdd-panel"), wr=panel.querySelector(".vh-gdd"); if(pn)pn.hidden=!GDD_OPEN; if(wr)wr.classList.toggle("open",GDD_OPEN);
+      gbtn.setAttribute("aria-expanded",GDD_OPEN?"true":"false"); if(GDD_OPEN){ const sb=panel.querySelector("#vh-gdd-search"); if(sb)sb.focus(); } });
+    const gsearch=panel.querySelector("#vh-gdd-search");
+    if(gsearch) gsearch.addEventListener("input",function(){ GDD_SEARCH=gsearch.value; filterGddList(panel,gsearch.value); });
+    panel.querySelectorAll("[data-gkey]").forEach(cb=>cb.addEventListener("change",function(){ GDD_OPEN=true; toggleFacet("group", cb.getAttribute("data-gkey")); }));
+    const gclr=panel.querySelector(".vh-gdd-clear");
+    if(gclr) gclr.addEventListener("click",function(e){ e.stopPropagation(); FACETS.group.clear(); GDD_OPEN=true; SECTION_LIMIT={}; renderAll(); });
+    if(!GDD_DOC_BOUND){ document.addEventListener("mousedown",function(e){ if(!GDD_OPEN)return; const w=document.querySelector(".vh-gdd"); if(w && !w.contains(e.target)){ GDD_OPEN=false; const pn=document.querySelector(".vh-gdd-panel"), wr=document.querySelector(".vh-gdd"), gb=document.querySelector("#vh-gdd-btn"); if(pn)pn.hidden=true; if(wr)wr.classList.remove("open"); if(gb)gb.setAttribute("aria-expanded","false"); } }); GDD_DOC_BOUND=true; }
   }
   function toggleFacet(facet,key){ const set=FACETS[facet]; if(!set)return; if(set.has(key))set.delete(key); else set.add(key);
     SECTION_LIMIT={}; renderAll(); announce("Showing "+filteredRows().length+" vehicles"); }
@@ -1414,6 +1449,10 @@ geotab.addin.vehicleHealth = () => {
     if(s.deviceVoltage!=null) add("Battery voltage", s.deviceVoltage, col(x=>x.sig&&x.sig.deviceVoltage), v=>(Math.round(v*10)/10).toFixed(1)+" V", false);
     if(kind==="diesel" && s.defLevel!=null) add("DEF level", s.defLevel, col(x=>x.sig&&x.sig.defLevel), v=>Math.round(v)+"%", false);
     if(r.co2&&r.co2.perHour!=null) add("CO\u2082 / engine-hr", r.co2.perHour, col(x=>x.co2&&x.co2.perHour), v=>v.toFixed(1)+" kg", true);
+    if(r.idleRatio!=null){ const med=median(col(x=>x.idleRatio!=null?x.idleRatio:null)); if(med!=null){
+      let vt=Math.round(r.idleRatio*100)+"%";
+      if(r.idleSec!=null && r.driveSec!=null && (r.idleSec+r.driveSec)>0) vt+=" ("+(r.idleSec/3600).toFixed(1)+" h idle / "+(r.driveSec/3600).toFixed(1)+" h driving)";
+      rows.push(benchRow("Idle time", vt, Math.round(med*100)+"%", r.idleRatio, med, true)); } }
     if(r.harsh!=null) add("Harsh events", r.harsh, col(x=>x.harsh!=null?x.harsh:null), v=>String(Math.round(v)), true);
     if(!rows.length) return "";
     return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>How this compares</h4><div class="vh-dsec-meta vh-muted">vs '+peers.length+' '+esc(scope)+'</div></div>'
@@ -1556,6 +1595,18 @@ geotab.addin.vehicleHealth = () => {
   }
   function bandLabelOf(score){ const k=bandKeyOf(score); const f=BAND_FACET.find(b=>b[0]===k); return f?f[1]:""; }
   function equipText(s){ const e=[]; if(s){ if(s.ptoEngaged!=null)e.push("PTO"); if(s.absEquipped!=null)e.push("ABS"); if(s.adasEquipped!=null)e.push("ADAS"); if(s.tpmsEquipped!=null)e.push("TPMS"); } return e.join(" "); }
+  // Active-fault codes for the CSV: J1939 SPN/FMI when present, else the description (which carries the OBD-II
+  // P-code when Geotab includes it). Strips our "- code N" phrasing so the SPN isn't printed twice.
+  function faultCodeCell(r){
+    const items=(r.items||[]).filter(i=>i.domState==="Active");
+    if(!items.length) return "";
+    return items.map(i=>{ let code=null;
+      if(i.spn!=null && i.fmi!=null) code="SPN "+i.spn+"/FMI "+i.fmi;
+      else if(i.spn!=null) code="SPN "+i.spn;
+      else if(i.fmi!=null) code="FMI "+i.fmi;
+      const desc=(i.name||"").replace(/\s*\u00b7\s*code\s*\d+/i,"").trim();
+      return (code?code+" \u2014 ":"")+desc; }).join("; ");
+  }
   function exportCSV(){
     const rows=filteredRows(); if(!rows.length)return;
     const order=actionsFor().map(a=>a.id);
@@ -1565,7 +1616,7 @@ geotab.addin.vehicleHealth = () => {
     const head=["Vehicle","Group(s)","Year","Make","Model","VIN","Plate","Fuel","Body class","Equipment",
       "Recommended action","Drivability","Primary reason",
       "Risk score","Risk band","Geotab predicted risk %",
-      "Worst fault","Active faults","Pending faults",
+      "Worst fault","Active fault codes","Active faults","Pending faults",
       "Faults score","Temp score","Pressure score","Usage score","Maint score","Battery score",
       "Coolant F","Oil pressure psi","Battery V","DEF %",
       "Open DVIR defects","Harsh events",
@@ -1580,7 +1631,7 @@ geotab.addin.vehicleHealth = () => {
         r.em&&(r.em.kind==="gas"||r.em.kind==="diesel")?(r.em.kind==="diesel"?"Diesel":"Gas"):"", det.body||"", equipText(s),
         r.disp, dr.label.replace(/\u2014/g,"-"), reasonText(r),
         r.score==null?"":Math.round(r.score), bandLabelOf(r.score), r.geotabRisk==null?"":Math.round(r.geotabRisk),
-        wf?wf.name+(wf.domState?" ("+String(wf.domState).toLowerCase()+")":""):"", act, pend,
+        wf?wf.name+(wf.domState?" ("+String(wf.domState).toLowerCase()+")":""):"", faultCodeCell(r), act, pend,
         r.terms.DTC==null?"":Math.round(r.terms.DTC), r.terms.T==null?"":Math.round(r.terms.T), r.terms.P==null?"":Math.round(r.terms.P),
         r.terms.U==null?"":Math.round(r.terms.U), r.terms.M==null?"":Math.round(r.terms.M), r.terms.B==null?"":Math.round(r.terms.B),
         s.coolant!=null?cToF(s.coolant):"", s.oilPressure!=null?kpaToPsi(s.oilPressure):"", s.deviceVoltage!=null?(Math.round(s.deviceVoltage*10)/10).toFixed(1):"", s.defLevel!=null?Math.round(s.defLevel):"",
