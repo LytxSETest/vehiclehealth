@@ -77,6 +77,8 @@ geotab.addin.vehicleHealth = () => {
     // Security-group ids allowed to CHANGE shared settings, IN ADDITION to built-in Administrator/Supervisor/Manager
     // clearances (auto-detected). Add a customer's custom admin clearance id here if their DB uses custom groups.
     adminGroupIds: [],
+    cohortOutlierDelta: 20,          // a row is flagged a cohort outlier when its risk score exceeds its make/model/year
+    cohortOutlierFloor: 40,          // peers' median by >=Delta AND is itself at least this score (Monitor band) - avoids noise
   };
 
   // ========================= pure helpers =========================
@@ -224,6 +226,7 @@ geotab.addin.vehicleHealth = () => {
   // Encoded GUID that isolates THIS add-in's stored data from every other add-in. Generated once - do NOT change it
   // (changing it orphans previously saved settings). Geotab format: "a" + 22 URL-safe base64 chars.
   const ADDIN_ID = "amM5ODA0OTgtMzBmZi04Y2E";
+  const BUILD = "2026-06-05.2";   // bump on each deploy; shown in the header so you can confirm which build is live
 
   // The only cutoffs a fleet manager can tune. Everything else (scoring weights, score bands, temp/pressure limits)
   // stays internal so scores stay comparable across fleets. Defaults mirror CONFIG (= the "Medium" presets).
@@ -271,8 +274,12 @@ geotab.addin.vehicleHealth = () => {
     return groups.some(g=>{ const id=g&&g.id; if(!id)return false;
       return CONFIG.adminGroupIds.indexOf(id)>-1 || ELEVATED_RE.test(id); });
   }
+  // Resolve whether the signed-in user is confidently an admin (built-in Administrator/Supervisor/Manager, or a
+  // clearance id allow-listed in CONFIG). This is only a HINT for the settings note. The actual permission to write
+  // the shared AddInData record is enforced by Geotab on Save, so a custom clearance (e.g. "Full Access") is never
+  // wrongly locked out of trying - it either saves or Geotab declines it with a clear message.
   function checkClearance(cb){
-    CAN_EDIT_SETTINGS=false;
+    SETTINGS_ADMIN=false;
     if(!API||!API.getSession){ return cb&&cb(); }
     let done=false; const fin=()=>{ if(done)return; done=true; cb&&cb(); };
     try{
@@ -280,7 +287,7 @@ geotab.addin.vehicleHealth = () => {
         const uname = session && (session.userName || (session.credentials&&session.credentials.userName));
         if(!uname){ return fin(); }
         API.call("Get",{typeName:"User",search:{name:uname}}, function(users){
-          try{ const u=users&&users[0]; CAN_EDIT_SETTINGS=isElevated((u&&u.securityGroups)||[]); }catch(e){}
+          try{ const u=users&&users[0]; SETTINGS_ADMIN=isElevated((u&&u.securityGroups)||[]); }catch(e){}
           fin();
         }, function(){ fin(); });
       }, function(){ fin(); });
@@ -302,21 +309,22 @@ geotab.addin.vehicleHealth = () => {
       }, function(){ SETTINGS=defaultSettings(); cb&&cb(); });
     }catch(e){ SETTINGS=defaultSettings(); cb&&cb(); }
   }
+  // A permission failure from Geotab on the AddInData write is the authoritative read-only signal; translate it.
+  function saveErr(err){ const t=errText(err); return /security|permission|clearance|insufficient|not allowed|denied|unauthor/i.test(t) ? "Geotab declined the change \u2014 your account doesn\u2019t have permission to manage these organization-wide settings." : t; }
   function saveSettings(next, done){
     next=sanitizeSettings(next);
-    if(!CAN_EDIT_SETTINGS){ return done&&done(false,"You need Administrator or Supervisor access to change these settings."); }
     if(!API||!API.call){ return done&&done(false,"Storage is not available in this session."); }
     const ok=()=>{ SETTINGS=next; done&&done(true,""); };
     try{
       if(SETTINGS_ID){
         API.call("Set",{typeName:"AddInData",entity:{id:SETTINGS_ID,addInId:ADDIN_ID,groups:[{id:"GroupCompanyId"}],details:next}},
-          function(){ ok(); }, function(err){ done&&done(false,errText(err)); });
+          function(){ ok(); }, function(err){ done&&done(false,saveErr(err)); });
       } else {
         API.call("Add",{typeName:"AddInData",entity:{addInId:ADDIN_ID,groups:[{id:"GroupCompanyId"}],details:next}},
           function(res){ SETTINGS_ID=(res&&res.id)?res.id:(typeof res==="string"?res:SETTINGS_ID); ok(); },
-          function(err){ done&&done(false,errText(err)); });
+          function(err){ done&&done(false,saveErr(err)); });
       }
-    }catch(e){ done&&done(false,errText(e)); }
+    }catch(e){ done&&done(false,saveErr(e)); }
   }
   // Load clearance + settings exactly once, then drain any waiters. Later calls run the callback immediately.
   function ensureSettings(cb){
@@ -600,7 +608,7 @@ geotab.addin.vehicleHealth = () => {
   // ---- configurable settings (loaded from Geotab AddInData on first focus) ----
   let SETTINGS=defaultSettings(); // active cutoffs (defaults until loaded)
   let SETTINGS_ID=null;           // AddInData object id (null until first save; enables in-place updates)
-  let CAN_EDIT_SETTINGS=false;    // true only for elevated clearances (fail-safe default: read-only)
+  let CAN_EDIT_SETTINGS=true, SETTINGS_ADMIN=false;   // form is editable; the AddInData save is the real authority (Geotab enforces). SETTINGS_ADMIN is only a confidence hint for the note.
   let SETTINGS_LOADED=false, SETTINGS_LOADING=false;
   const ENS_Q=[];                 // callbacks waiting on the one-time settings load
   let SET_FORM=null;              // working copy of settings while the panel is open
@@ -847,10 +855,11 @@ geotab.addin.vehicleHealth = () => {
               idleRatio: up.idleRatio, idleSec: (tp?tp.idleSec:null), driveSec: (tp?tp.driveSec:null),
               em, co2, noData:!hasData, sig:s };
           });
+          markCohortOutliers(COMPUTED);
           LOADING=false; lockRefresh(false); LAST_UPDATED=new Date(); SECTION_LIMIT={};
           renderAll();
           const trunc = TRUNC.length ? " \u00b7 <b style=\"color:#B54708\">\u26a0 "+TRUNC.join("/")+" truncated \u2014 narrow window/group</b>" : "";
-          setStatus("<b>"+COMPUTED.length+"</b> vehicles \u00b7 "+WINDOW_DAYS+"-day window"+trunc);
+          setStatus("<b>"+COMPUTED.length+"</b> vehicles \u00b7 "+WINDOW_DAYS+"-day window"+trunc+" \u00b7 <span class=\"vh-muted\">build "+BUILD+"</span>");
           announce(COMPUTED.length+" vehicles loaded. "+actionNeededCount()+" need attention."+(TRUNC.length?" Warning: some results were truncated.":""));
           enrichVins();
         };
@@ -1273,8 +1282,9 @@ geotab.addin.vehicleHealth = () => {
     const cmpCls = (COMPARE_MODE?" cmp":"")+(csel?" sel":"");
     const dr=drivability(r);
     const dnd=(!r.noData && dr.key==="tow")?'<span class="vh-dnd" title="'+esc(dr.label+(dr.why?" \u2014 "+dr.why:""))+'">\u26a0 Do not drive</span>':'';
+    const cohort=(TAB==="breakdown" && r.cohortOutlier)?' <span class="vh-cohort" title="Risk score is well above its '+esc([r.year,r.make,r.model].filter(Boolean).join(" "))+' peers (cohort median '+Math.round(r.cohortMedian)+')">\u25b2 vs cohort</span>':'';
     const head='<span class="vh-dot" style="background:'+HUE[a.cls]+'" aria-hidden="true"></span>'
-      +'<span class="vh-rowname"><span class="vh-rowtop"><span class="vh-nm">'+esc(r.name)+'</span>'+dnd+dev+grp+'</span>'+sub+'</span>';
+      +'<span class="vh-rowname"><span class="vh-rowtop"><span class="vh-nm">'+esc(r.name)+'</span>'+dnd+dev+grp+cohort+'</span>'+sub+'</span>';
     if(TAB==="breakdown"){
       const mid = r.noData ? '<span class="vh-chip chip-none">'+esc(r.noDataReason||"No data")+'</span>'
         : ((contribHTML(r)+behaviorChip(r)) || '<span class="vh-chip chip-none">No active issues</span>');
@@ -1484,8 +1494,10 @@ geotab.addin.vehicleHealth = () => {
       +'<div class="vh-prows">'+rows+eqHTML+'</div></section>';
   }
 
-  // Peer benchmarking: compare a vehicle against the median of its fuel-type peers (fallback: whole fleet) to
-  // surface "running hotter / weaker / dirtier than the pack". Differences within +/-10% of median read as typical.
+  // Drawer comparison. Two changes from a plain fuel-type median: (1) the peer set is the vehicle's own
+  // make/model/year cohort where the fleet has >=3 of them (falling back to make/model, then fuel type, then the
+  // whole fleet), so "how this compares" is against true peers; (2) the risk score is judged against its absolute
+  // band, not the fleet median - a 33 reads "Monitor", not a misleading "above median" when the fleet median is 1.
   function median(arr){ if(!arr.length)return null; const a=arr.slice().sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
   function benchRow(label, valTxt, medTxt, val, med, higherWorse){
     const denom=Math.abs(med)>1e-9?Math.abs(med):1, rel=(val-med)/denom; let arrow="\u2248", word="typical", tone="typical";
@@ -1495,18 +1507,42 @@ geotab.addin.vehicleHealth = () => {
     return '<div class="vh-brow"><span class="vh-blab">'+esc(label)+'</span><span class="vh-bval">'+esc(valTxt)+'</span>'
       +'<span class="vh-bmed">median '+esc(medTxt)+'</span><span class="vh-bind" style="color:'+c+'">'+arrow+' '+word+'</span></div>';
   }
+  const RISK_BAND_HUE={"High risk":"#B42318","Priority maint.":"#B42318","Schedule inspection":"#B54708","Monitor":"#B54708","Normal":"#067647"};
+  function thresholdRow(label, valTxt, bandLabel, color){
+    return '<div class="vh-brow"><span class="vh-blab">'+esc(label)+'</span><span class="vh-bval">'+esc(valTxt)+'</span>'
+      +'<span class="vh-bmed">vs threshold</span><span class="vh-bind" style="color:'+color+'">'+esc(bandLabel)+'</span></div>';
+  }
+  // Cohort selection: own year+make+model, then make+model, then fuel type, then whole fleet; first set with enough peers.
+  function cohortPeers(r){
+    const base=COMPUTED.filter(x=>!x.noData);
+    if(r.make&&r.model&&r.year){ const ymm=base.filter(x=>x.make===r.make&&x.model===r.model&&x.year===r.year); if(ymm.length>=3) return {peers:ymm, scope:[r.year,r.make,r.model].filter(Boolean).join(" "), tight:true}; }
+    if(r.make&&r.model){ const mm=base.filter(x=>x.make===r.make&&x.model===r.model); if(mm.length>=3) return {peers:mm, scope:[r.make,r.model].filter(Boolean).join(" "), tight:true}; }
+    const kind=r.em&&r.em.kind, byKind=base.filter(x=>x.em&&x.em.kind===kind);
+    if(byKind.length>=5) return {peers:byKind, scope:kind==="diesel"?"diesel vehicles":kind==="gas"?"gas vehicles":"vehicles", tight:false};
+    return {peers:base, scope:"vehicles", tight:false};
+  }
+  // List-view cohort outliers: within a make/model/year cohort of >=3 scored vehicles, flag any whose risk score sits
+  // a full margin (CONFIG.cohortOutlierDelta) above the cohort median and is itself at least Monitor - i.e. degrading
+  // faster than identical trucks, independent of where it lands in the absolute sort. O(n): one pass to bucket, one to mark.
+  function markCohortOutliers(rows){
+    const by={};
+    rows.forEach(r=>{ if(r){ r.cohortOutlier=false; r.cohortMedian=null; r.cohortSize=0; }
+      if(!r||r.noData||r.score==null||!r.make||!r.model||!r.year) return;
+      const k=r.year+"|"+r.make+"|"+r.model; (by[k]=by[k]||[]).push(r); });
+    Object.keys(by).forEach(k=>{ const grp=by[k]; if(grp.length<3) return; const med=median(grp.map(x=>x.score));
+      grp.forEach(r=>{ r.cohortMedian=med; r.cohortSize=grp.length;
+        r.cohortOutlier = (r.score-med)>=CONFIG.cohortOutlierDelta && r.score>=CONFIG.cohortOutlierFloor; }); });
+  }
   function benchmarkSection(r){
     if(r.noData) return "";
     const kind=r.em&&r.em.kind;
-    let peers=COMPUTED.filter(x=>!x.noData && x.em && x.em.kind===kind), scope=kind==="diesel"?"diesel vehicles":kind==="gas"?"gas vehicles":"vehicles";
-    if(peers.length<5){ peers=COMPUTED.filter(x=>!x.noData); scope="vehicles"; }
+    const cp=cohortPeers(r), peers=cp.peers, scope=cp.scope;
     if(peers.length<3) return "";
     const s=r.sig||{}, rows=[], col=fn=>peers.map(fn).filter(v=>v!=null);
     const add=(label,val,vals,fmt,hw)=>{ if(val==null)return; const med=median(vals.filter(v=>v!=null)); if(med==null)return; rows.push(benchRow(label,fmt(val),fmt(med),val,med,hw)); };
-    add("Risk score", r.score, col(x=>x.score), v=>String(Math.round(v)), true);
+    if(r.score!=null){ const b=band(r.score); rows.push(thresholdRow("Risk score", String(Math.round(r.score)), b[0], RISK_BAND_HUE[b[0]]||"#475467")); }
     if(s.coolant!=null) add("Coolant temp", s.coolant, col(x=>x.sig&&x.sig.coolant), v=>cToF(v)+"\u00b0F", true);
     if(s.oilPressure!=null) add("Oil pressure", s.oilPressure, col(x=>x.sig&&x.sig.oilPressure), v=>kpaToPsi(v)+" psi", false);
-    if(s.deviceVoltage!=null) add("Battery voltage", s.deviceVoltage, col(x=>x.sig&&x.sig.deviceVoltage), v=>(Math.round(v*10)/10).toFixed(1)+" V", false);
     if(kind==="diesel" && s.defLevel!=null) add("DEF level", s.defLevel, col(x=>x.sig&&x.sig.defLevel), v=>Math.round(v)+"%", false);
     if(r.co2&&r.co2.perHour!=null) add("CO\u2082 / engine-hr", r.co2.perHour, col(x=>x.co2&&x.co2.perHour), v=>v.toFixed(1)+" kg", true);
     if(r.idleRatio!=null){ const med=median(col(x=>x.idleRatio!=null?x.idleRatio:null)); if(med!=null){
@@ -1515,7 +1551,8 @@ geotab.addin.vehicleHealth = () => {
       rows.push(benchRow("Idle time", vt, Math.round(med*100)+"%", r.idleRatio, med, true)); } }
     if(r.harsh!=null) add("Harsh events", r.harsh, col(x=>x.harsh!=null?x.harsh:null), v=>String(Math.round(v)), true);
     if(!rows.length) return "";
-    return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>How this compares</h4><div class="vh-dsec-meta vh-muted">vs '+peers.length+' '+esc(scope)+'</div></div>'
+    const lbl="vs "+peers.length+" "+esc(scope)+(/vehicles$/.test(scope)?"":" peer"+(peers.length===1?"":"s"));
+    return '<section class="vh-dsec"><div class="vh-dsec-h"><h4>How this compares</h4><div class="vh-dsec-meta vh-muted">'+lbl+'</div></div>'
       +'<div class="vh-bench">'+rows.join("")+'</div></section>';
   }
 
@@ -1585,6 +1622,10 @@ geotab.addin.vehicleHealth = () => {
   }
   function notifyMailto(r){ return "mailto:?subject="+encodeURIComponent("Vehicle health - "+r.name+": "+drivability(r).label.replace(/\u2014/g,"-"))+"&body="+encodeURIComponent(notifySummary(r)); }
   function gotoRules(){ try{ if(STATE && typeof STATE.gotoPage==="function") STATE.gotoPage("rules"); }catch(e){} }
+  // Open the vehicle's record in MyGeotab via the add-in's page-state navigation (no URL building - the add-in is hosted
+  // off-domain so it can't know the server/database; gotoPage navigates within the current session). Geotab exposes no
+  // documented per-device exceptions-report deep link, so harsh-event drill-down lands on the vehicle record.
+  function gotoDevice(id){ try{ if(id && STATE && typeof STATE.gotoPage==="function") STATE.gotoPage("device",{id:id}); }catch(e){} }
   function copyText(txt,btn){ const done=()=>{ if(btn){ const o=btn.getAttribute("data-lab")||"Copy"; btn.textContent="Copied \u2713"; setTimeout(()=>{ btn.textContent=o; },1500); } };
     try{ if(typeof navigator!=="undefined" && navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).then(done,function(){}); return; } }catch(e){}
     try{ const ta=document.createElement("textarea"); ta.value=txt; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); done(); }catch(e){} }
@@ -1593,6 +1634,7 @@ geotab.addin.vehicleHealth = () => {
       +'<a class="vh-actbtn vh-actbtn-primary" href="'+notifyMailto(r)+'">Notify by email</a>'
       +'<button class="vh-actbtn" type="button" id="vh-act-copy" data-lab="Copy summary">Copy summary</button>'
       +'<button class="vh-actbtn" type="button" id="vh-act-rule">Set up alert in Geotab</button>'
+      +'<button class="vh-actbtn" type="button" id="vh-act-open">Open in Geotab</button>'
       +'</div><div class="vh-dact-note">Set up a rule in Geotab to be alerted automatically when a vehicle crosses a limit (e.g. engine coolant temperature).</div>';
   }
   function drawerHTML(r){
@@ -1613,6 +1655,7 @@ geotab.addin.vehicleHealth = () => {
     const dx=el("vh-dx"); if(dx)dx.addEventListener("click",closeDrawer);
     const cp=el("vh-act-copy"); if(cp)cp.addEventListener("click",()=>{ const r=COMPUTED.find(x=>x.id===CURRENT_DRAWER_ID); if(r)copyText(notifySummary(r),cp); });
     const rl=el("vh-act-rule"); if(rl)rl.addEventListener("click",gotoRules);
+    const op=el("vh-act-open"); if(op)op.addEventListener("click",()=>{ const r=COMPUTED.find(x=>x.id===CURRENT_DRAWER_ID); if(r)gotoDevice(r.id); });
   }
   function refreshDrawerBody(r){ const d=el("vh-drawer"); if(!d)return; d.innerHTML=drawerHTML(r); bindDrawer(); }
   function openDrawer(id,fromEl){
@@ -1745,7 +1788,7 @@ geotab.addin.vehicleHealth = () => {
   function renderSettings(){
     const md=el("vh-settings"); if(!md||!SET_FORM)return;
     const ro=!CAN_EDIT_SETTINGS;
-    const banner = ro ? '<div class="vh-readonly">These settings are shared across your whole organization. Changing them requires Administrator or Supervisor access, so they\u2019re read-only for you.</div>' : '';
+    const banner = SETTINGS_ADMIN ? '' : '<div class="vh-readonly">These settings are shared across your whole organization and are saved in Geotab. If your account doesn\u2019t have permission to manage them, your save will be declined.</div>';
     const harshN=SET_FORM.harsh.normal, harshC=SET_FORM.harsh.critical;
     const idleN=pct(SET_FORM.idle.normal), idleC=pct(SET_FORM.idle.critical);
     const stale=SET_FORM.staleHours;
@@ -1847,7 +1890,10 @@ geotab.addin.vehicleHealth = () => {
     initialize(api,state,callback){ API=api; STATE=state;
       try{ loadState(); }catch(e){}
       const on=(id,ev,fn)=>{ const e=el(id); if(e)e.addEventListener(ev,fn); };
-      const w=el("vh-window"); if(w)w.value=String(WINDOW_DAYS);
+      const w=el("vh-window");
+      if(w){ const opts=Array.prototype.map.call(w.options||[],o=>Number(o.value)).filter(n=>!isNaN(n));
+        if(opts.length && opts.indexOf(WINDOW_DAYS)<0){ WINDOW_DAYS=opts.reduce((a,b)=>Math.abs(b-WINDOW_DAYS)<Math.abs(a-WINDOW_DAYS)?b:a, opts[0]); }
+        w.value=String(WINDOW_DAYS); }
       on("vh-refresh","click",()=>{ clearDiagCatalog(); run(); });
       on("vh-window","change",()=>{ const w2=el("vh-window"); WINDOW_DAYS=Number(w2&&w2.value)||WINDOW_DAYS; run(); });
       on("vh-tab-bd","click",()=>setTab("breakdown"));
