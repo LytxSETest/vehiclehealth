@@ -6,7 +6,7 @@ geotab.addin.vehicleHealth = () => {
     bands: [ [90,"High risk","vhs-b-high"], [75,"Priority maint.","vhs-b-priority"],
              [60,"Schedule inspection","vhs-b-inspect"], [40,"Monitor","vhs-b-monitor"],
              [0,"Normal","vhs-b-normal"] ],
-    maxDevices: 50000, faultLookbackDays: 30, statusLookbackDays: 7, statusLookbackFastDays: 1, statusLookbackSlowDays: 30, pageSize: 25,
+    maxDevices: 50000, faultLookbackDays: 7, statusLookbackDays: 7, statusLookbackFastDays: 1, statusLookbackSlowDays: 30, pageSize: 25,
     faultLimit: 50000, exceptionLimit: 50000, dvirLimit: 10000, ruleLimit: 2000, statusLimit: 500,
     batteryFaultKeywords: ["battery","low voltage"],
     deviceFaultKeywords:  ["device","restarted","power was removed","gps","antenna","tamper","telematics"],
@@ -68,7 +68,7 @@ geotab.addin.vehicleHealth = () => {
     // ---- scale + UI ----
     tripLimit: 50000,
     statusLimitPerDiagnostic: 50000, // cap per diagnostic-wide StatusData query (scales by signal, not by vehicle)
-    maxStatusPages: 40,              // safety ceiling on overflow pages per signal (50k rows each) when a query exceeds the per-call cap
+    maxStatusPages: 5,               // bounded page budget per query (50k rows each). Keeps loads interactive; if a query still has data beyond this, show the truncation banner rather than grind through millions of rows. Narrow the window/group to fetch less.
     sectionPreviewRows: 25,          // rows shown per action group before "show more"
     defaultCollapsedActions: ["Monitor","OK","No data"], // groups collapsed on first load
     rootGroupIds: ["GroupCompanyId"],// excluded from group labels / rollup (every vehicle is in it)
@@ -226,7 +226,7 @@ geotab.addin.vehicleHealth = () => {
   // Encoded GUID that isolates THIS add-in's stored data from every other add-in. Generated once - do NOT change it
   // (changing it orphans previously saved settings). Geotab format: "a" + 22 URL-safe base64 chars.
   const ADDIN_ID = "amM5ODA0OTgtMzBmZi04Y2E";
-  const BUILD = "2026-06-05.2";   // bump on each deploy; shown in the header so you can confirm which build is live
+  const BUILD = "2026-06-05.3";   // bump on each deploy; shown in the header so you can confirm which build is live
 
   // The only cutoffs a fleet manager can tune. Everything else (scoring weights, score bands, temp/pressure limits)
   // stays internal so scores stay comparable across fleets. Defaults mirror CONFIG (= the "Medium" presets).
@@ -588,7 +588,7 @@ geotab.addin.vehicleHealth = () => {
     }
     return {rows:all, truncated};
   }
-  let TAB="breakdown", VIEW="list", FILTER=null, FILTER_ID="all", SEARCH="", WINDOW_DAYS=30;
+  let TAB="breakdown", VIEW="list", FILTER=null, FILTER_ID="all", SEARCH="", WINDOW_DAYS=7;
   // Multi-facet filters that AND-combine with each other and with the disposition pills/KPIs. Each facet is a
   // Set of selected keys (empty = unconstrained); chips within a facet OR together. factor/band are breakdown-only.
   let FACETS = { factor:new Set(), band:new Set(), fuel:new Set(), group:new Set() };
@@ -627,7 +627,6 @@ geotab.addin.vehicleHealth = () => {
       const s=JSON.parse(raw);
       if(s.tab) TAB=s.tab;
       if(s.view) VIEW=s.view;
-      if(typeof s.windowDays==="number") WINDOW_DAYS=s.windowDays;
       if(s.collapsed && typeof s.collapsed==="object") COLLAPSED=s.collapsed;
       if(s.filterId){ FILTER_ID=s.filterId; FILTER=filterSetFromId(s.filterId); }
       if(s.facets && typeof s.facets==="object"){ ["factor","band","fuel","group"].forEach(f=>{ if(Array.isArray(s.facets[f])) FACETS[f]=new Set(s.facets[f]); }); }
@@ -1512,6 +1511,12 @@ geotab.addin.vehicleHealth = () => {
     return '<div class="vh-brow"><span class="vh-blab">'+esc(label)+'</span><span class="vh-bval">'+esc(valTxt)+'</span>'
       +'<span class="vh-bmed">vs threshold</span><span class="vh-bind" style="color:'+color+'">'+esc(bandLabel)+'</span></div>';
   }
+  // Status word + colour for a reading measured against its own healthy thresholds (for absolute-band rows like voltage).
+  function sigStatus(v, sg){
+    if(!sg||v==null) return {label:"\u2014", color:"#475467"};
+    if(sg.dir==="low"){ if(v<sg.critical) return {label:"Weak", color:"#B42318"}; if(v<sg.normal) return {label:"Low", color:"#B54708"}; return {label:"Healthy", color:"#067647"}; }
+    if(v>sg.critical) return {label:"High", color:"#B42318"}; if(v>sg.normal) return {label:"Elevated", color:"#B54708"}; return {label:"Healthy", color:"#067647"};
+  }
   // Cohort selection: own year+make+model, then make+model, then fuel type, then whole fleet; first set with enough peers.
   function cohortPeers(r){
     const base=COMPUTED.filter(x=>!x.noData);
@@ -1543,6 +1548,7 @@ geotab.addin.vehicleHealth = () => {
     if(r.score!=null){ const b=band(r.score); rows.push(thresholdRow("Risk score", String(Math.round(r.score)), b[0], RISK_BAND_HUE[b[0]]||"#475467")); }
     if(s.coolant!=null) add("Coolant temp", s.coolant, col(x=>x.sig&&x.sig.coolant), v=>cToF(v)+"\u00b0F", true);
     if(s.oilPressure!=null) add("Oil pressure", s.oilPressure, col(x=>x.sig&&x.sig.oilPressure), v=>kpaToPsi(v)+" psi", false);
+    if(s.deviceVoltage!=null){ const vst=sigStatus(s.deviceVoltage, CONFIG.signals.deviceVoltage); rows.push(thresholdRow("Battery voltage", (Math.round(s.deviceVoltage*10)/10).toFixed(1)+" V", vst.label, vst.color)); }
     if(kind==="diesel" && s.defLevel!=null) add("DEF level", s.defLevel, col(x=>x.sig&&x.sig.defLevel), v=>Math.round(v)+"%", false);
     if(r.co2&&r.co2.perHour!=null) add("CO\u2082 / engine-hr", r.co2.perHour, col(x=>x.co2&&x.co2.perHour), v=>v.toFixed(1)+" kg", true);
     if(r.idleRatio!=null){ const med=median(col(x=>x.idleRatio!=null?x.idleRatio:null)); if(med!=null){
