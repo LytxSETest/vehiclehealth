@@ -68,6 +68,7 @@ geotab.addin.vehicleHealth = () => {
     // ---- scale + UI ----
     tripLimit: 50000,
     statusLimitPerDiagnostic: 50000, // cap per diagnostic-wide StatusData query (scales by signal, not by vehicle)
+    maxStatusPages: 40,              // safety ceiling on overflow pages per signal (50k rows each) when a query exceeds the per-call cap
     sectionPreviewRows: 25,          // rows shown per action group before "show more"
     defaultCollapsedActions: ["Monitor","OK","No data"], // groups collapsed on first load
     rootGroupIds: ["GroupCompanyId"],// excluded from group labels / rollup (every vehicle is in it)
@@ -537,6 +538,48 @@ geotab.addin.vehicleHealth = () => {
 
   // ========================= state =========================
   let API=null, STATE=null, NAME_BY_ID={}, GROUP_BY_ID={}, FM_BY_ID={}, COMPUTED=[], LOADING=false, LAST_UPDATED=null, DB="";
+  const callP=(method,params)=>new Promise((resolve,reject)=>API.call(method,params,resolve,reject));
+  // When one diagnostic's StatusData query hits the 50k per-call cap, fetch the remainder by paging on the
+  // documented Date sort (offset = last record's DateTime, lastId = its Id), reducing each page as it arrives.
+  // Returns true only if the safety page-cap was reached with data still outstanding (a genuine truncation).
+  async function pageStatusRemainder(search, firstBatch, reduceFn){
+    const PER=CONFIG.statusLimitPerDiagnostic, MAXP=CONFIG.maxStatusPages;
+    if(!firstBatch || firstBatch.length<PER) return false;     // didn't hit the cap -> nothing to page
+    let last=firstBatch[firstBatch.length-1], pages=0;
+    while(pages<MAXP && last && last.dateTime!=null){
+      let batch;
+      try{ batch=await callP("Get",{typeName:"StatusData", search, sort:{sortBy:"Date", offset:last.dateTime, lastId:last.id}, resultsLimit:PER}); }
+      catch(e){ return true; }                                  // paging failed -> treat as still-truncated, don't hang
+      if(!batch || !batch.length) return false;                // reached the end cleanly
+      reduceFn(batch); pages++;
+      last=batch[batch.length-1];
+      if(batch.length<PER) return false;                        // last partial page -> done
+    }
+    return true;                                                // hit the safety cap with data remaining
+  }
+  // Fetch an ENTIRE windowed dataset from scratch by paging on a documented sort, used when the first capped
+  // batch shows the fleet exceeds one call's 50k limit. sortBy "Date" (FaultData/ExceptionEvent/Trip: offset=last
+  // dateTime + lastId) or "Id" (Device: offset=last id, ascending - ids are unique so no lastId is needed).
+  // Returns the complete row set so existing processing runs unchanged. On a sort rejection it returns rows:null
+  // so the caller can fall back to the unsorted first batch (no worse than today).
+  async function pageAllSorted(typeName, baseSearch, perPage, sortBy){
+    sortBy=sortBy||"Date"; const byId=(sortBy==="Id");
+    const MAXP=CONFIG.maxStatusPages, all=[]; let offset=null, lastId=null, pages=0, truncated=false;
+    while(pages<MAXP){
+      const sort={sortBy}; if(byId)sort.sortDirection="Asc";
+      if(offset!=null){ sort.offset=offset; if(!byId)sort.lastId=lastId; }
+      let batch;
+      try{ batch=await callP("Get",{typeName, search:baseSearch, sort, resultsLimit:perPage}); }
+      catch(e){ if(pages===0) return {rows:null, truncated:true}; truncated=true; break; }
+      if(!batch || !batch.length) break;
+      for(let j=0;j<batch.length;j++) all.push(batch[j]);
+      pages++;
+      const last=batch[batch.length-1]; offset = byId ? (last&&last.id) : (last&&last.dateTime); lastId=last&&last.id;
+      if(batch.length<perPage) break;                            // reached the end of the window
+      if(pages>=MAXP){ truncated=true; break; }                  // safety cap with data still outstanding
+    }
+    return {rows:all, truncated};
+  }
   let TAB="breakdown", VIEW="list", FILTER=null, FILTER_ID="all", SEARCH="", WINDOW_DAYS=30;
   // Multi-facet filters that AND-combine with each other and with the disposition pills/KPIs. Each facet is a
   // Set of selected keys (empty = unconstrained); chips within a facet OR together. factor/band are breakdown-only.
@@ -695,26 +738,36 @@ geotab.addin.vehicleHealth = () => {
     const groups=normGroups(STATE); const deviceSearch=groups.length?{groups}:{};
     const wsel=el("vh-window"); WINDOW_DAYS=Number(wsel&&wsel.value)||WINDOW_DAYS||CONFIG.faultLookbackDays;
     const fFrom=daysAgo(WINDOW_DAYS);
+    // Date-windowed transactional pulls are group-scoped when a group is selected, so scoping a large fleet to a
+    // depot actually reduces what's fetched (not just what's displayed) - a real lever for large databases.
+    const txSearch = groups.length ? {fromDate:fFrom, deviceSearch:{groups}} : {fromDate:fFrom};
 
     API.multiCall([
       ["Get",{typeName:"Device",search:deviceSearch,resultsLimit:CONFIG.maxDevices}],
-      ["Get",{typeName:"FaultData",search:{fromDate:fFrom},resultsLimit:CONFIG.faultLimit}],
-      ["Get",{typeName:"ExceptionEvent",search:{fromDate:fFrom},resultsLimit:CONFIG.exceptionLimit}],
-      ["Get",{typeName:"DVIRLog",search:{fromDate:fFrom},resultsLimit:CONFIG.dvirLimit}],
+      ["Get",{typeName:"FaultData",search:txSearch,resultsLimit:CONFIG.faultLimit}],
+      ["Get",{typeName:"ExceptionEvent",search:txSearch,resultsLimit:CONFIG.exceptionLimit}],
+      ["Get",{typeName:"DVIRLog",search:txSearch,resultsLimit:CONFIG.dvirLimit}],
       ["Get",{typeName:"Rule",resultsLimit:CONFIG.ruleLimit}],
       ["Get",{typeName:"Group",resultsLimit:CONFIG.maxGroups}],
-      ["Get",{typeName:"Trip",search:{fromDate:fFrom},resultsLimit:CONFIG.tripLimit}],
+      ["Get",{typeName:"Trip",search:txSearch,resultsLimit:CONFIG.tripLimit}],
       ["Get",{typeName:"DeviceStatusInfo",resultsLimit:CONFIG.maxDevices}],
       ["Get",{typeName:"FailureMode",resultsLimit:5000}],
-    ], r => {
-      const devices=r[0],faults=r[1],exceptions=r[2],dvirs=r[3],rules=r[4],allGroups=r[5],trips=r[6],dsiAll=r[7],failModes=r[8];
+    ], async r => {
+      let devices=r[0],faults=r[1],exceptions=r[2],dvirs=r[3],rules=r[4],allGroups=r[5],trips=r[6],dsiAll=r[7],failModes=r[8];
       if(!devices||!devices.length){ LOADING=false; lockRefresh(false); COMPUTED=[]; LAST_UPDATED=new Date();
         setStatus("No vehicles for the current group filter."); renderAll(); return; }
+      // Scale: a full first page means the fleet exceeds one call's 50k limit, so page the rest and run the
+      // existing per-vehicle processing on the complete set. Fleets under the cap make no extra calls.
+      let devTrunc=false, faultTrunc=false, evTrunc=false, tripTrunc=false; const dvirTrunc=(dvirs||[]).length>=CONFIG.dvirLimit;
+      if(devices.length>=CONFIG.maxDevices){ setStatus("Loading all vehicles\u2026"); const o=await pageAllSorted("Device",deviceSearch,CONFIG.maxDevices,"Id"); if(o.rows)devices=o.rows; devTrunc=o.truncated; }
+      if((faults||[]).length>=CONFIG.faultLimit){ setStatus("Fetching all fault records across the fleet\u2026"); const o=await pageAllSorted("FaultData",txSearch,CONFIG.faultLimit); if(o.rows)faults=o.rows; faultTrunc=o.truncated; }
+      if((exceptions||[]).length>=CONFIG.exceptionLimit){ setStatus("Fetching all event records across the fleet\u2026"); const o=await pageAllSorted("ExceptionEvent",txSearch,CONFIG.exceptionLimit); if(o.rows)exceptions=o.rows; evTrunc=o.truncated; }
+      if((trips||[]).length>=CONFIG.tripLimit){ setStatus("Fetching all trip records across the fleet\u2026"); const o=await pageAllSorted("Trip",txSearch,CONFIG.tripLimit); if(o.rows)trips=o.rows; tripTrunc=o.truncated; }
       const idSet=new Set(devices.map(d=>d.id));
       GROUP_BY_ID={}; (allGroups||[]).forEach(g=>{ GROUP_BY_ID[g.id]=g.name||g.id; });
       FM_BY_ID={}; (failModes||[]).forEach(m=>{ if(m&&m.id)FM_BY_ID[m.id]={code:m.code, name:m.name}; });
-      // truncation guard: a Get that returns exactly its cap probably lost records
-      TRUNC=[]; if((devices||[]).length>=CONFIG.maxDevices)TRUNC.push("vehicles"); if((faults||[]).length>=CONFIG.faultLimit)TRUNC.push("faults"); if((exceptions||[]).length>=CONFIG.exceptionLimit)TRUNC.push("events"); if((trips||[]).length>=CONFIG.tripLimit)TRUNC.push("trips"); if((dvirs||[]).length>=CONFIG.dvirLimit)TRUNC.push("inspections");
+      // truncation now reflects post-paging: flagged only if a query hit the page-cap with data still outstanding
+      TRUNC=[]; if(devTrunc)TRUNC.push("vehicles"); if(faultTrunc)TRUNC.push("faults"); if(evTrunc)TRUNC.push("events"); if(tripTrunc)TRUNC.push("trips"); if(dvirTrunc)TRUNC.push("inspections");
 
       // trips by device: distance (m), idle + drive seconds over the window
       const tripByDev={}; (trips||[]).forEach(t=>{ const dv=t.device&&t.device.id; if(!dv||!idSet.has(dv))return;
@@ -752,6 +805,7 @@ geotab.addin.vehicleHealth = () => {
         // ONE query per diagnostic across the whole filtered fleet (not per-device): ~N_signals calls regardless of fleet size.
         const calls=active.map(k=>["Get",{typeName:"StatusData",
           search:Object.assign({diagnosticSearch:{id:sigId[k]},fromDate:(FAST.has(k)?fastFrom:slowFrom)}, groups.length?{deviceSearch:{groups}}:{}),
+          sort:{sortBy:"Date"},
           resultsLimit:CONFIG.statusLimitPerDiagnostic}]);
 
         const compute=(latestBy,firstBy)=>{
@@ -803,16 +857,22 @@ geotab.addin.vehicleHealth = () => {
 
         if(!calls.length){ compute({},{}); return; }
         setStatus("Reading "+calls.length+" signal series across the fleet\u2026");
-        API.multiCall(calls, results => {
+        API.multiCall(calls, async results => {
           const latestBy={}, firstBy={}, latestT={}, firstT={};
           let sigTrunc=false;
-          results.forEach((rows,i)=>{ const k=active[i]; if(!rows)return;
-            if(rows.length>=CONFIG.statusLimitPerDiagnostic)sigTrunc=true;
-            rows.forEach(rec=>{ const dv=rec.device&&rec.device.id; if(!dv||!idSet.has(dv))return; const t=rec.dateTime; if(!t)return;
-              const lT=(latestT[dv]=latestT[dv]||{}); if(lT[k]==null||t>lT[k]){ (latestBy[dv]=latestBy[dv]||{})[k]=rec.data; lT[k]=t; }
-              const fT=(firstT[dv]=firstT[dv]||{}); if(fT[k]==null||t<fT[k]){ (firstBy[dv]=firstBy[dv]||{})[k]=rec.data; fT[k]=t; }
-            });
-          });
+          const reduceRows=(rows,k)=>{ rows.forEach(rec=>{ const dv=rec.device&&rec.device.id; if(!dv||!idSet.has(dv))return; const t=rec.dateTime; if(!t)return;
+            const lT=(latestT[dv]=latestT[dv]||{}); if(lT[k]==null||t>lT[k]){ (latestBy[dv]=latestBy[dv]||{})[k]=rec.data; lT[k]=t; }
+            const fT=(firstT[dv]=firstT[dv]||{}); if(fT[k]==null||t<fT[k]){ (firstBy[dv]=firstBy[dv]||{})[k]=rec.data; fT[k]=t; }
+          }); };
+          for(let i=0;i<results.length;i++){
+            const k=active[i]; const rows=results[i]||[];
+            reduceRows(rows,k);
+            if(rows.length>=CONFIG.statusLimitPerDiagnostic){     // capped: page the remainder before computing
+              setStatus("Fetching additional signal readings\u2026");
+              const t=await pageStatusRemainder(calls[i][1].search, rows, b=>reduceRows(b,k));
+              if(t)sigTrunc=true;
+            }
+          }
           if(sigTrunc && TRUNC.indexOf("signal readings")<0)TRUNC.push("signal readings");
           compute(latestBy,firstBy);
         }, fail);
